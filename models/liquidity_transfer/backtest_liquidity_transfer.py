@@ -28,6 +28,8 @@ from typing import List, Dict, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
 
+from core.costs import round_trip_fees, slip
+
 
 # ==============================================================================
 # CONFIGURATION & CONSTANTS
@@ -76,6 +78,7 @@ class Trade:
     duration_bars: int
     entry_type: str
     htf_bias_source: str
+    fees: float = 0.0
 
 
 # ==============================================================================
@@ -314,6 +317,34 @@ def simulate_liquidity_transfer(
         "be_exits": 0,
     }
 
+    def _book_exit(ct: Dict[str, Any], exit_price: float, exit_maker: bool,
+                   exit_reason: str, i: int) -> float:
+        """Close the position, append the Trade record, return net PnL (after fees)."""
+        d = 1 if ct["direction"] == "LONG" else -1
+        gross = d * (exit_price - ct["entry"]) * ct["contracts"]
+        fees = round_trip_fees(ct["contracts"], ct["entry"], exit_price,
+                               entry_maker=ct["entry_maker"], exit_maker=exit_maker)
+        net = gross - fees
+        trades.append(Trade(
+            timestamp=ct["entry_time"].strftime("%Y-%m-%d %H:%M"),
+            symbol=symbol,
+            direction=ct["direction"],
+            entry=round(ct["entry"], 4),
+            sl=round(ct["sl"], 4),
+            tp=round(ct["tp"], 4),
+            exit_price=round(exit_price, 4),
+            exit_reason=exit_reason,
+            pnl=round(net, 2),
+            r_multiple=round(net / RISK_PER_TRADE_USD, 2),
+            contracts=round(ct["contracts"], 4),
+            risk_price=round(ct["risk_price"], 4),
+            duration_bars=i - ct["entry_idx"],
+            entry_type=ct["entry_type"],
+            htf_bias_source=ct["htf_source"],
+            fees=round(fees, 2),
+        ))
+        return net
+
     start_idx = min(50, n_bars - 1)
 
     for i in range(start_idx, n_bars):
@@ -336,159 +367,36 @@ def simulate_liquidity_transfer(
         # IN-TRADE MANAGEMENT
         # ----------------------------------------------------------------------
         if in_trade and current_trade is not None:
-            direction = current_trade["direction"]
-            entry = current_trade["entry"]
-            sl = current_trade["sl"]
-            tp = current_trade["tp"]
-            be_trig = current_trade["be_trigger"]
-            be_armed = current_trade["be_armed"]
-            planned_rr = current_trade.get("planned_rr", rr)
+            # Intrabar order is unknown, so resolve conservatively:
+            #   1. stop (as it stood at bar open) first, 2. then target,
+            #   3. break-even arming only takes effect from the NEXT bar.
+            ct = current_trade
+            d = 1 if ct["direction"] == "LONG" else -1
+            stop_hit = (l <= ct["sl"]) if d == 1 else (h >= ct["sl"])
+            tp_hit = (h >= ct["tp"]) if d == 1 else (l <= ct["tp"])
 
-            if direction == "LONG":
-                # Check Auto-Breakeven Trigger
-                if h >= be_trig and not be_armed:
-                    current_trade["be_armed"] = True
-                    current_trade["sl"] = entry
+            exit_reason = None
+            if stop_hit:
+                exit_reason = "BE" if ct["be_armed"] else "SL"
+                exit_price = slip(ct["sl"], d, is_entry=False)
+                exit_maker = False
+            elif tp_hit:
+                exit_reason = "TP"
+                exit_price = ct["tp"]
+                exit_maker = True
+            else:
+                be_reached = (h >= ct["be_trigger"]) if d == 1 else (l <= ct["be_trigger"])
+                if be_reached and not ct["be_armed"]:
+                    ct["be_armed"] = True
+                    ct["sl"] = ct["entry"]
 
-                # Check Take Profit Hit first
-                if h >= tp:
-                    pnl = RISK_PER_TRADE_USD * planned_rr
-                    r_mult = planned_rr
-                    exit_price = tp
-
-                    account += pnl
-                    peak_account = max(peak_account, account)
-                    max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
-
-                    trades.append(Trade(
-                        timestamp=current_trade["entry_time"].strftime("%Y-%m-%d %H:%M"),
-                        symbol=symbol,
-                        direction=direction,
-                        entry=round(entry, 4),
-                        sl=round(sl, 4),
-                        tp=round(tp, 4),
-                        exit_price=round(exit_price, 4),
-                        exit_reason="TP",
-                        pnl=round(pnl, 2),
-                        r_multiple=round(r_mult, 2),
-                        contracts=round(current_trade["contracts"], 4),
-                        risk_price=round(current_trade["risk_price"], 4),
-                        duration_bars=i - current_trade["entry_idx"],
-                        entry_type=current_trade["entry_type"],
-                        htf_bias_source=current_trade["htf_source"]
-                    ))
-                    funnel["tp_exits"] += 1
-                    in_trade = False
-                    current_trade = None
-
-                # Check Stop Loss / Breakeven Hit
-                elif l <= current_trade["sl"]:
-                    exit_reason = "BE" if current_trade["be_armed"] else "SL"
-                    pnl = 0.0 if current_trade["be_armed"] else -RISK_PER_TRADE_USD
-                    r_mult = 0.0 if current_trade["be_armed"] else -1.0
-                    exit_price = current_trade["sl"]
-
-                    account += pnl
-                    peak_account = max(peak_account, account)
-                    max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
-
-                    trades.append(Trade(
-                        timestamp=current_trade["entry_time"].strftime("%Y-%m-%d %H:%M"),
-                        symbol=symbol,
-                        direction=direction,
-                        entry=round(entry, 4),
-                        sl=round(sl, 4),
-                        tp=round(tp, 4),
-                        exit_price=round(exit_price, 4),
-                        exit_reason=exit_reason,
-                        pnl=round(pnl, 2),
-                        r_multiple=round(r_mult, 2),
-                        contracts=round(current_trade["contracts"], 4),
-                        risk_price=round(current_trade["risk_price"], 4),
-                        duration_bars=i - current_trade["entry_idx"],
-                        entry_type=current_trade["entry_type"],
-                        htf_bias_source=current_trade["htf_source"]
-                    ))
-                    if exit_reason == "BE":
-                        funnel["be_exits"] += 1
-                    else:
-                        funnel["sl_exits"] += 1
-
-                    in_trade = False
-                    current_trade = None
-
-            else:  # SHORT
-                # Check Auto-Breakeven Trigger
-                if l <= be_trig and not be_armed:
-                    current_trade["be_armed"] = True
-                    current_trade["sl"] = entry
-
-                # Check Take Profit Hit first
-                if l <= tp:
-                    pnl = RISK_PER_TRADE_USD * planned_rr
-                    r_mult = planned_rr
-                    exit_price = tp
-
-                    account += pnl
-                    peak_account = max(peak_account, account)
-                    max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
-
-                    trades.append(Trade(
-                        timestamp=current_trade["entry_time"].strftime("%Y-%m-%d %H:%M"),
-                        symbol=symbol,
-                        direction=direction,
-                        entry=round(entry, 4),
-                        sl=round(sl, 4),
-                        tp=round(tp, 4),
-                        exit_price=round(exit_price, 4),
-                        exit_reason="TP",
-                        pnl=round(pnl, 2),
-                        r_multiple=round(r_mult, 2),
-                        contracts=round(current_trade["contracts"], 4),
-                        risk_price=round(current_trade["risk_price"], 4),
-                        duration_bars=i - current_trade["entry_idx"],
-                        entry_type=current_trade["entry_type"],
-                        htf_bias_source=current_trade["htf_source"]
-                    ))
-                    funnel["tp_exits"] += 1
-                    in_trade = False
-                    current_trade = None
-
-                # Check Stop Loss / Breakeven Hit
-                elif h >= current_trade["sl"]:
-                    exit_reason = "BE" if current_trade["be_armed"] else "SL"
-                    pnl = 0.0 if current_trade["be_armed"] else -RISK_PER_TRADE_USD
-                    r_mult = 0.0 if current_trade["be_armed"] else -1.0
-                    exit_price = current_trade["sl"]
-
-                    account += pnl
-                    peak_account = max(peak_account, account)
-                    max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
-
-                    trades.append(Trade(
-                        timestamp=current_trade["entry_time"].strftime("%Y-%m-%d %H:%M"),
-                        symbol=symbol,
-                        direction=direction,
-                        entry=round(entry, 4),
-                        sl=round(sl, 4),
-                        tp=round(tp, 4),
-                        exit_price=round(exit_price, 4),
-                        exit_reason=exit_reason,
-                        pnl=round(pnl, 2),
-                        r_multiple=round(r_mult, 2),
-                        contracts=round(current_trade["contracts"], 4),
-                        risk_price=round(current_trade["risk_price"], 4),
-                        duration_bars=i - current_trade["entry_idx"],
-                        entry_type=current_trade["entry_type"],
-                        htf_bias_source=current_trade["htf_source"]
-                    ))
-                    if exit_reason == "BE":
-                        funnel["be_exits"] += 1
-                    else:
-                        funnel["sl_exits"] += 1
-
-                    in_trade = False
-                    current_trade = None
+            if exit_reason is not None:
+                account += _book_exit(ct, exit_price, exit_maker, exit_reason, i)
+                peak_account = max(peak_account, account)
+                max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
+                funnel[{"TP": "tp_exits", "SL": "sl_exits", "BE": "be_exits"}[exit_reason]] += 1
+                in_trade = False
+                current_trade = None
 
             # Skip checking new setups while already in position
             continue
@@ -725,6 +633,7 @@ def simulate_liquidity_transfer(
 
                         current_trade = {
                             "direction": "LONG",
+                            "entry_maker": entry_px == entry_lvl,  # resting limit filled at its price
                             "entry_time": t,
                             "entry_idx": i,
                             "entry": entry_px,
@@ -741,6 +650,15 @@ def simulate_liquidity_transfer(
                         in_trade = True
                         pending_setup = None
                         funnel["retest_entries"] += 1
+                        # The fill bar can also reach the stop; order unknown -> assume stopped
+                        if (l <= sl) if current_trade["direction"] == "LONG" else (h >= sl):
+                            account += _book_exit(current_trade, slip(sl, 1 if current_trade["direction"] == "LONG" else -1, is_entry=False),
+                                                  False, "SL", i)
+                            peak_account = max(peak_account, account)
+                            max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
+                            funnel["sl_exits"] += 1
+                            in_trade = False
+                            current_trade = None
 
             else:  # SHORT
                 # Structural invalidation: price violates sweep high before fill
@@ -758,6 +676,7 @@ def simulate_liquidity_transfer(
 
                         current_trade = {
                             "direction": "SHORT",
+                            "entry_maker": entry_px == entry_lvl,  # resting limit filled at its price
                             "entry_time": t,
                             "entry_idx": i,
                             "entry": entry_px,
@@ -774,6 +693,15 @@ def simulate_liquidity_transfer(
                         in_trade = True
                         pending_setup = None
                         funnel["retest_entries"] += 1
+                        # The fill bar can also reach the stop; order unknown -> assume stopped
+                        if (l <= sl) if current_trade["direction"] == "LONG" else (h >= sl):
+                            account += _book_exit(current_trade, slip(sl, 1 if current_trade["direction"] == "LONG" else -1, is_entry=False),
+                                                  False, "SL", i)
+                            peak_account = max(peak_account, account)
+                            max_drawdown_usd = max(max_drawdown_usd, peak_account - account)
+                            funnel["sl_exits"] += 1
+                            in_trade = False
+                            current_trade = None
 
     sim_metadata = {
         "final_account": round(account, 2),
@@ -782,6 +710,7 @@ def simulate_liquidity_transfer(
         "max_drawdown_pct": round((max_drawdown_usd / peak_account) * 100, 2) if peak_account > 0 else 0.0,
         "floor_breached": floor_breached,
         "funnel": funnel,
+        "open_trade": current_trade,   # position still running at the end of the data
     }
     return trades, sim_metadata
 
@@ -819,6 +748,7 @@ def calculate_metrics(trades: List[Trade], metadata: Dict[str, Any]) -> Dict[str
 
     net_pnl_usd = sum(t.pnl for t in trades)
     net_pnl_r = sum(t.r_multiple for t in trades)
+    total_fees = sum(t.fees for t in trades)
 
     # Disaggregated Stats (Long vs Short)
     long_trades = [t for t in trades if t.direction == "LONG"]
@@ -863,6 +793,7 @@ def calculate_metrics(trades: List[Trade], metadata: Dict[str, Any]) -> Dict[str
         "profit_factor": profit_factor,
         "net_pnl_usd": net_pnl_usd,
         "net_pnl_r": net_pnl_r,
+        "total_fees": total_fees,
         "max_dd_usd": metadata.get("max_drawdown_usd", 0.0),
         "max_dd_pct": metadata.get("max_drawdown_pct", 0.0),
         "long_trades": len(long_trades),
@@ -908,6 +839,9 @@ def print_institutional_report(metrics: Dict[str, Any], symbol: str, funnel: Dic
     pnl_sign = "+" if metrics['net_pnl_usd'] >= 0 else ""
     print(f"    Net PnL (USD):             {pnl_sign}${metrics['net_pnl_usd']:,.2f}")
     print(f"    Net PnL (R-Multiples):     {pnl_sign}{metrics['net_pnl_r']:.2f}R")
+    if metrics.get("total_trades"):
+        print(f"    Fees Paid (in PnL):        ${metrics.get('total_fees', 0.0):,.2f} "
+              f"({metrics.get('total_fees', 0.0) / metrics['total_trades'] / RISK_PER_TRADE_USD:.2f}R per trade)")
     print(f"    Max Drawdown:              ${metrics['max_dd_usd']:,.2f} ({metrics['max_dd_pct']:.2f}%)")
 
     print(f"\n{sub_border}")
@@ -953,10 +887,11 @@ def export_trades_csv(trades: List[Trade], filepath: str) -> None:
             "pnl": "PnL",
             "r_multiple": "R_Multiple",
             "contracts": "Contracts",
-            "risk_price": "Risk_USD",
+            "risk_price": "Risk_Price",   # stop distance in price units (was mislabelled Risk_USD)
             "duration_bars": "Duration_Bars",
             "entry_type": "Entry_Type",
-            "htf_bias_source": "HTF_Source"
+            "htf_bias_source": "HTF_Source",
+            "fees": "Fees",
         }, inplace=True)
 
     df_trades.to_csv(filepath, index=False)

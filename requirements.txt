@@ -2,5 +2,14 @@ ccxt>=4.1.0
 pandas>=2.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
+mplfinance            # core/chart_worker.py chart snapshots
+six                   # imported by mplfinance but not declared as its dependency
 openpyxl
-argparse
+
+# Telegram bot (telegramBot/)
+python-telegram-bot>=20.0
+python-dotenv
+openai                # NVIDIA-hosted LLM via the OpenAI-compatible client
+
+# Tests: python -m pytest tests models/liquidity_transfer -q
+pytest

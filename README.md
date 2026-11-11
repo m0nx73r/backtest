@@ -73,15 +73,37 @@ python challenge_trader.py
 
 ---
 
-## 📊 Backtest Benchmarks (April 2026)
+## 📊 Backtest Benchmarks (re-run Nov 2026)
 
-The Tiered A-Tier model achieves significantly higher quality outcomes by filtering out low-probability B-Tier "volume kill" trades.
+> [!WARNING]
+> The April 2026 figures previously listed here (BNB PF 2.11, ETH 1.43, BTC 1.21) came from a
+> CISD backtest with look-ahead bias (1H/1D candles used before they closed, order blocks used
+> before they were confirmed) and no trading fees. They are not reproducible and have been removed.
 
-| Asset | Model | Trades | Win Rate | Profit Factor |
-| :--- | :--- | :--- | :--- | :--- |
-| **BNB/USDT** | A-Tier | 120 | **63.6%** | **2.11** |
-| **ETH/USDT** | A-Tier | 482 | **42.9%** | **1.43** |
-| **BTC/USDT** | A-Tier | 494 | **38.2%** | **1.21** |
+Binance spot data, Oct 2025 – Nov 2026, fees included (taker 0.05% / maker 0.02% per side, see
+`FEE_TAKER` / `FEE_MAKER` in `core/config.py`). PF = net profit factor over all trades.
+
+| Model | Asset | Trades | Win rate (ex-BE) | Net PF | Net PnL | Fees |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| CISD (1D→1H→5M) | BTC/USDT | 100 | 40.0% | 0.94 | −$173 | 0.20R/trade |
+| CISD | ETH/USDT | 52 | 41.7% | 1.01 | +$19 | 0.14R/trade |
+| CISD | SOL/USDT | 66 | 41.3% | 1.02 | +$36 | 0.14R/trade |
+| CISD | BNB/USDT | 102 | 22.5% | 0.48 | −$1,814 | 0.16R/trade |
+| Liquidity Transfer (4H→15M) | BTC/USDT | 173 | 35.2% | 1.20 | +$411 | 0.07R/trade |
+| Liquidity Transfer | ETH/USDT | 48 | 22.5% | 0.53 | −$314 (floor hit) | 0.05R/trade |
+| Liquidity Transfer | SOL/USDT | 180 | 30.7% | 1.04 | +$78 | 0.05R/trade |
+
+None of the CISD results pass the bootstrap Monte Carlo gate (≥65% profitable resamples).
+Sample sizes of 50–180 trades are too small to distinguish PF ≈ 1.0–1.2 from noise.
+
+### Reproducing
+
+```bash
+python -m tools.fetch_candles --days 400                       # BTC/ETH/SOL/BNB, 5m-1d
+python -m models.backtest_cisd --symbol BTC/USDT
+python -m models.liquidity_transfer.backtest_liquidity_transfer --symbol BTC/USDT
+python -m pytest tests models/liquidity_transfer -q            # includes look-ahead tests
+```
 
 ---
 
@@ -89,7 +111,7 @@ The Tiered A-Tier model achieves significantly higher quality outcomes by filter
 
 All strategy rules are centralized in **`core/config.py`**. 
 
-- `MIN_SETUP_TIER`: Set to `"A"` to automatically block low-probability B-tier setups.
+- `MIN_SETUP_TIER`: Set to `"A"` to automatically block low-probability B-tier setups (currently `"B"` in config).
 - `MAX_TRADES_PER_DAY`: Hard cap to prevent over-trading in ranging conditions.
 - `PROTECTED_SWING_LOOKBACK`: Defines structural SL depth (replaces tight FVG boundary stops).
 - `RETIRED_ALIGNMENTS`: Preserves management logic for legacy trades (Scalp, Intraday, Macro).

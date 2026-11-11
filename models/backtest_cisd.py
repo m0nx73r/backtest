@@ -27,6 +27,7 @@ from core.config import (
 from core.analysis import (
     print_enhanced_stats, classify_regime
 )
+from core.costs import bar_duration, to_close_time_index, fee_usd, slip
 
 # Module-level symbol (set by CLI or multi-asset runner)
 SYMBOL = "BTC/USDT"
@@ -41,7 +42,7 @@ def fetch_ohlcv_full(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
     safe_symbol = symbol.replace("/", "_")
     filename = os.path.join(DATA_DIR, safe_symbol, f"{timeframe}.csv")
     if not os.path.exists(filename):
-        raise FileNotFoundError(f"Missing {filename}. Run: python fetch_candles.py --symbol {symbol} --days {days}")
+        raise FileNotFoundError(f"Missing {filename}. Run: python -m tools.fetch_candles --symbol {symbol} --days {days + 35}")
     df = pd.read_csv(filename)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df.set_index("timestamp", inplace=True)
@@ -115,10 +116,19 @@ def get_liquidity_sweeps(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     return detect_liquidity_sweeps(df.copy(), lookback=10)
 
 
-def find_order_blocks(df: pd.DataFrame) -> List[Dict]:
+def find_order_blocks(df: pd.DataFrame, require_full_window: bool = False) -> List[Dict]:
     """
     Order Block detection.
     Bullish OB = last bearish candle before an aggressive bullish impulse at a swing low.
+
+    An OB at bar j is only *knowable* once the impulse (bar j+1) has closed and the
+    swing check has seen OB_SWING_LOOKBACK bars to the right of j. Each OB therefore
+    carries `confirm_idx` / `confirm_time` (the bar whose close confirms it); callers
+    must not use an OB before that bar. `time` stays the OB candle's own timestamp.
+
+    require_full_window=True (backtests) skips OBs near the end of `df` whose swing
+    window is incomplete, so the result for bar j never depends on how much data
+    follows it. The live scanner keeps the default (False) to see the newest OBs.
     """
     obs = []
     avg_range = (df['high'] - df['low']).rolling(20).mean()
@@ -134,6 +144,9 @@ def find_order_blocks(df: pd.DataFrame) -> List[Dict]:
             j = i - 1
             if j < 0:
                 continue
+            if require_full_window and j + OB_SWING_LOOKBACK > len(df) - 1:
+                continue
+            confirm_idx = min(len(df) - 1, max(i, j + OB_SWING_LOOKBACK))
             if body_val > 0:  # Bullish Impulse
                 if df['close'].iloc[j] < df['open'].iloc[j]:
                     ob_high = df['high'].iloc[j]
@@ -149,7 +162,9 @@ def find_order_blocks(df: pd.DataFrame) -> List[Dict]:
                                 "high": ob_high, "low": ob_low,
                                 "median": (ob_open + ob_close) / 2,
                                 "active": True,
-                                "type": "bull"
+                                "type": "bull",
+                                "confirm_idx": confirm_idx,
+                                "confirm_time": df.index[confirm_idx],
                             })
             else:  # Bearish Impulse
                 if df['close'].iloc[j] > df['open'].iloc[j]:
@@ -166,7 +181,9 @@ def find_order_blocks(df: pd.DataFrame) -> List[Dict]:
                                 "high": ob_high, "low": ob_low,
                                 "median": (ob_open + ob_close) / 2,
                                 "active": True,
-                                "type": "bear"
+                                "type": "bear",
+                                "confirm_idx": confirm_idx,
+                                "confirm_time": df.index[confirm_idx],
                             })
     return obs
 
@@ -668,19 +685,35 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
     auto_be = use_auto_be if use_auto_be is not None else USE_AUTO_BREAKEVEN
     ltf_msb = use_ltf_msb if use_ltf_msb is not None else False
 
+    # ── Causal time alignment ──
+    # Candles are stamped with their OPEN time. A decision on LTF bar i is made at
+    # that bar's CLOSE, and may only use HTF bars that have CLOSED by then. We
+    # re-label the HTF frames by close time so `index <= decision_time` is causal.
+    ltf_dur = bar_duration(df_ltf)
+    df_bias = to_close_time_index(df_bias)
+    if df_daily is not None:
+        df_daily = to_close_time_index(df_daily)
+    decision_times = df_ltf.index + ltf_dur
+
     # Get bias with reasoning
     bias_result = get_hourly_bias(df_bias)
     bias_series = bias_result['bias']
     bias_reasons = bias_result['bias_reason']
 
-    # Align bias to entry TF
-    bias_aligned = bias_series.reindex(df_ltf.index, method='ffill')
-    reason_aligned = bias_reasons.reindex(df_ltf.index, method='ffill').fillna("")
+    # Align bias to entry TF (value of the last HTF bar closed at/before each LTF close)
+    bias_aligned = pd.Series(bias_series.reindex(decision_times, method='ffill').fillna(0).values,
+                             index=df_ltf.index)
+    reason_aligned = pd.Series(bias_reasons.reindex(decision_times, method='ffill').fillna("").values,
+                               index=df_ltf.index)
 
     fvgs_ltf = calc_fvgs(df_ltf)
 
-    htf_obs = find_order_blocks(df_bias)
-    ltf_obs_list = find_order_blocks(df_ltf) if USE_LTF_OB_ENTRY else []
+    htf_obs = find_order_blocks(df_bias, require_full_window=True)   # confirm_time is a close time
+    ltf_obs_list = find_order_blocks(df_ltf, require_full_window=True) if USE_LTF_OB_ENTRY else []
+    # LTF OBs become tradable zones only on their confirmation bar
+    ltf_obs_by_confirm: Dict[int, List[Dict]] = {}
+    for o in ltf_obs_list:
+        ltf_obs_by_confirm.setdefault(o['confirm_idx'], []).append(o)
 
     trades = []
     account = ACCOUNT_SIZE
@@ -698,149 +731,102 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
     active_bull_fvgs = []
     active_bear_fvgs = []
 
+    max_bars = MAX_TRADE_DURATION.get(TF_ENTRY, 96)
+
+    def _close_trade(tr, exit_px, exit_maker, result, i, timestamp):
+        """Book a full exit. PnL = partial leg + remainder leg, net of all fees."""
+        d, e, q = tr["direction"], tr["Entry $"], tr["qty"]
+        rem = 1.0 - (PARTIAL_EXIT_PCT if tr["partial_exit_done"] else 0.0)
+        gross = d * (exit_px - e) * q * rem + tr["partial_gross"]
+        fees = fee_usd(q, e, maker=False) + fee_usd(q * rem, exit_px, exit_maker) + tr["partial_fee"]
+        net = gross - fees
+        tr.update({
+            "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
+            "Exit $": round(exit_px, 8),
+            "result": result,
+            "gross_pnl": round(gross, 2), "fees": round(fees, 2),
+            "pnl": round(net, 2),
+            "duration_bars": i - tr["_entry_idx"],
+            "r_multiple": round(net / FIXED_SL_USDT, 3),
+        })
+        return net
+
     for i in range(25, len(df_ltf)):
         funnel["Total Bars Scanned"] += 1
         row = df_ltf.iloc[i]
         timestamp = df_ltf.index[i]
+        decision_time = decision_times[i]   # this bar's close: when decisions are made
 
-        # -- Register new FVGs --
+        # -- Register new zones (FVGs formed on this bar; OBs confirmed on this bar) --
         if fvgs_ltf['fvg_bull'].iloc[i]:
             btm = fvgs_ltf['fvg_bull_btm'].iloc[i]
             top = fvgs_ltf['fvg_bull_top'].iloc[i]
             if not pd.isna(btm) and not pd.isna(top):
-                active_bull_fvgs.append((btm, top, i, timestamp))
+                active_bull_fvgs.append((btm, top, i, timestamp, "FVG"))
         if fvgs_ltf['fvg_bear'].iloc[i]:
             btm = fvgs_ltf['fvg_bear_btm'].iloc[i]
             top = fvgs_ltf['fvg_bear_top'].iloc[i]
             if not pd.isna(btm) and not pd.isna(top):
-                active_bear_fvgs.append((btm, top, i, timestamp))
+                active_bear_fvgs.append((btm, top, i, timestamp, "FVG"))
+        for o in ltf_obs_by_confirm.get(i, []):
+            zone = (o['low'], o['high'], i, o['time'], "OB")
+            (active_bull_fvgs if o['type'] == 'bull' else active_bear_fvgs).append(zone)
+        # Drop zones past the 48-bar touch window
+        if i % 50 == 0:
+            active_bull_fvgs = [z for z in active_bull_fvgs if i - z[2] <= 48]
+            active_bear_fvgs = [z for z in active_bear_fvgs if i - z[2] <= 48]
 
         # -- Trade management --
+        # Intrabar order is unknown, so resolve conservatively:
+        #   1. stop (as it stood at bar open) is checked first,
+        #   2. then target,
+        #   3. BE / partial updates only take effect from the NEXT bar.
         if in_trade:
-            direction = current_trade["direction"]
-            entry_px  = current_trade["Entry $"]
-            entry_idx = current_trade["_entry_idx"]
+            tr = current_trade
+            d = tr["direction"]
+            hi, lo = row['high'], row['low']
 
-            # ── Time invalidation (Gap #2) ──
-            # Close stale trades that never reached 1R within the max bar limit
-            max_bars = MAX_TRADE_DURATION.get(TF_ENTRY, 96)
-            bars_open = i - entry_idx
-            if bars_open > max_bars:
-                # Check if 1R was ever reached
-                price_slice = df_ltf.iloc[entry_idx:i + 1]
-                risk_px = current_trade["risk_price"]
-                if direction == 1:  # LONG
-                    best = price_slice["high"].max()
-                    one_r_hit = (best - entry_px) >= risk_px
-                else:              # SHORT
-                    best = price_slice["low"].min()
-                    one_r_hit = (entry_px - best) >= risk_px
-                if not one_r_hit:
-                    pnl = -FIXED_SL_USDT
-                    account += pnl
-                    current_trade.update({
-                        "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
-                        "result": "TIME_INVALID", "pnl": pnl, "account": account,
-                        "duration_bars": bars_open,
-                        "r_multiple": -1.0
-                    })
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
+            def reached(level):
+                return hi >= level if d == 1 else lo <= level
+
+            stop_hit = lo <= tr["Stop $"] if d == 1 else hi >= tr["Stop $"]
+            if stop_hit:
+                result = "BE" if tr["is_be"] else "LOSS"
+                account += _close_trade(tr, slip(tr["Stop $"], d, is_entry=False), False, result, i, timestamp)
+            elif reached(tr["Target $"]):
+                if not tr["partial_exit_done"] and tr["partial_trigger"] != tr["Target $"] and reached(tr["partial_trigger"]):
+                    q_part = tr["qty"] * PARTIAL_EXIT_PCT
+                    tr["partial_gross"] = d * (tr["partial_trigger"] - tr["Entry $"]) * q_part
+                    tr["partial_fee"] = fee_usd(q_part, tr["partial_trigger"], maker=True)
+                    tr["partial_exit_done"] = True
+                account += _close_trade(tr, tr["Target $"], True, "WIN", i, timestamp)
+            else:
+                fav_px = hi if d == 1 else lo
+                tr["max_fav_r"] = max(tr["max_fav_r"], d * (fav_px - tr["Entry $"]) / tr["risk_price"])
+                bars_open = i - tr["_entry_idx"]
+                if bars_open > max_bars and tr["max_fav_r"] < 1.0:
+                    # Time invalidation: exit at market on this bar's close
+                    account += _close_trade(tr, slip(row['close'], d, is_entry=False), False,
+                                            "TIME_INVALID", i, timestamp)
+                else:
+                    if not tr["partial_exit_done"] and reached(tr["partial_trigger"]):
+                        q_part = tr["qty"] * PARTIAL_EXIT_PCT
+                        tr["partial_gross"] = d * (tr["partial_trigger"] - tr["Entry $"]) * q_part
+                        tr["partial_fee"] = fee_usd(q_part, tr["partial_trigger"], maker=True)
+                        tr["partial_exit_done"] = True
+                    if auto_be and not tr["is_be"] and reached(tr["be_trigger"]):
+                        tr["Stop $"] = tr["Entry $"]
+                        tr["is_be"] = True
+                        tr["be_triggered"] = True
                     continue
-
-            if direction == 1:  # LONG
-                if auto_be and not current_trade.get("is_be", False):
-                    if row['high'] >= current_trade["be_trigger"]:
-                        current_trade["Stop $"] = current_trade["Entry $"]
-                        current_trade["is_be"] = True
-                        current_trade["be_triggered"] = True
-
-                if not current_trade.get("partial_exit_done", False):
-                    if row['high'] >= current_trade["partial_trigger"]:
-                        current_trade["partial_exit_done"] = True
-                        partial_pnl = (FIXED_SL_USDT * RISK_REWARD) * PARTIAL_EXIT_PCT
-                        account += partial_pnl
-
-                if row['low'] <= current_trade["Stop $"]:
-                    result = "BE" if current_trade.get("be_triggered", False) else "LOSS"
-                    if current_trade.get("partial_exit_done", False):
-                        pnl = 0.0
-                    else:
-                        pnl = 0.0 if result == "BE" else -FIXED_SL_USDT
-                    account += pnl
-                    current_trade.update({
-                        "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
-                        "result": result, "pnl": pnl, "account": account,
-                        "duration_bars": i - current_trade["_entry_idx"],
-                        "r_multiple": pnl / abs(FIXED_SL_USDT) if pnl != 0 else 0
-                    })
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
-                elif row['high'] >= current_trade["Target $"]:
-                    if current_trade.get("partial_exit_done", False):
-                        pnl = (FIXED_SL_USDT * RISK_REWARD) * PARTIAL_EXIT_PCT
-                    else:
-                        pnl = FIXED_SL_USDT * RISK_REWARD
-                    account += pnl
-                    current_trade.update({
-                        "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
-                        "result": "WIN", "pnl": pnl, "account": account,
-                        "duration_bars": i - current_trade["_entry_idx"],
-                        "r_multiple": RISK_REWARD
-                    })
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
-            else:  # SHORT
-                if auto_be and not current_trade.get("is_be", False):
-                    if row['low'] <= current_trade["be_trigger"]:
-                        current_trade["Stop $"] = current_trade["Entry $"]
-                        current_trade["is_be"] = True
-                        current_trade["be_triggered"] = True
-
-                if not current_trade.get("partial_exit_done", False):
-                    if row['low'] <= current_trade["partial_trigger"]:
-                        current_trade["partial_exit_done"] = True
-                        partial_pnl = (FIXED_SL_USDT * RISK_REWARD) * PARTIAL_EXIT_PCT
-                        account += partial_pnl
-
-                if row['high'] >= current_trade["Stop $"]:
-                    result = "BE" if current_trade.get("be_triggered", False) else "LOSS"
-                    if current_trade.get("partial_exit_done", False):
-                        pnl = 0.0
-                    else:
-                        pnl = 0.0 if result == "BE" else -FIXED_SL_USDT
-                    account += pnl
-                    current_trade.update({
-                        "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
-                        "result": result, "pnl": pnl, "account": account,
-                        "duration_bars": i - current_trade["_entry_idx"],
-                        "r_multiple": pnl / abs(FIXED_SL_USDT) if pnl != 0 else 0
-                    })
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
-                elif row['low'] <= current_trade["Target $"]:
-                    if current_trade.get("partial_exit_done", False):
-                        pnl = (FIXED_SL_USDT * RISK_REWARD) * PARTIAL_EXIT_PCT
-                    else:
-                        pnl = FIXED_SL_USDT * RISK_REWARD
-                    account += pnl
-                    current_trade.update({
-                        "exit_time": timestamp.strftime("%Y-%m-%d %H:%M"),
-                        "result": "WIN", "pnl": pnl, "account": account,
-                        "duration_bars": i - current_trade["_entry_idx"],
-                        "r_multiple": RISK_REWARD
-                    })
-                    trades.append(current_trade)
-                    in_trade = False
-                    current_trade = None
+            tr["account"] = account
+            trades.append(tr)
+            in_trade = False
+            current_trade = None
             continue
 
         # ================================================================
-        # ENTRY LOGIC — FVG Reaction
+        # ENTRY LOGIC — FVG / OB Reaction
         # ================================================================
 
         b = bias_aligned.iloc[i]
@@ -850,83 +836,46 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
 
         htf_reason = reason_aligned.iloc[i]
 
-        # ── Check for FVG touch (price entering an active FVG zone) ──
+        # ── Check for a touch of an active zone (FVG or confirmed OB) ──
         best_fvg = None
         ltf_reason_detail = ""
+        zones = active_bull_fvgs if b == 1 else active_bear_fvgs
+        for z in zones:
+            z_btm, z_top, z_idx, z_time, z_kind = z
+            if i - z_idx < 2 or i - z_idx > 48:
+                continue
+            touched = (row['low'] <= z_top and row['close'] > z_btm) if b == 1 \
+                else (row['high'] >= z_btm and row['close'] < z_top)
+            if touched and (best_fvg is None or z_idx > best_fvg[2]):
+                best_fvg = z
+                ltf_reason_detail = (f"{z_kind} Reaction (zone {z_btm:.2f}-{z_top:.2f}, "
+                                     f"formed @ {z_time.strftime('%m-%d %H:%M')})")
 
-        if b == 1:
-            for fvg in active_bull_fvgs:
-                fvg_btm, fvg_top, fvg_idx, fvg_time = fvg
-                if i - fvg_idx < 2:
-                    continue
-                if i - fvg_idx > 48:
-                    continue
-                if row['low'] <= fvg_top and row['close'] > fvg_btm:
-                    if best_fvg is None or fvg_idx > best_fvg[2]:
-                        best_fvg = fvg
-                        ltf_reason_detail = f"FVG Reaction (zone {fvg_btm:.2f}-{fvg_top:.2f}, formed @ {fvg_time.strftime('%m-%d %H:%M')})"
-        elif b == -1:
-            for fvg in active_bear_fvgs:
-                fvg_btm, fvg_top, fvg_idx, fvg_time = fvg
-                if i - fvg_idx < 2:
-                    continue
-                if i - fvg_idx > 48:
-                    continue
-                if row['high'] >= fvg_btm and row['close'] < fvg_top:
-                    if best_fvg is None or fvg_idx > best_fvg[2]:
-                        best_fvg = fvg
-                        ltf_reason_detail = f"FVG Reaction (zone {fvg_btm:.2f}-{fvg_top:.2f}, formed @ {fvg_time.strftime('%m-%d %H:%M')})"
-
-        # Also check current-bar FVGs (immediate entry on formation)
+        # Also allow entry on the bar that completes a new FVG (known at this bar's close)
         fvg_bull = fvgs_ltf['fvg_bull'].iloc[i]
         fvg_bear = fvgs_ltf['fvg_bear'].iloc[i]
-        has_ob = False
 
-        if USE_LTF_OB_ENTRY:
-            ob_bull = any(o['time'] == timestamp and o['type'] == 'bull' for o in ltf_obs_list)
-            ob_bear = any(o['time'] == timestamp and o['type'] == 'bear' for o in ltf_obs_list)
-            if b == 1 and ob_bull:
-                has_ob = True
-                if not ltf_reason_detail:
-                    ltf_reason_detail = f"OB Entry (formed @ {timestamp.strftime('%m-%d %H:%M')})"
-            if b == -1 and ob_bear:
-                has_ob = True
-                if not ltf_reason_detail:
-                    ltf_reason_detail = f"OB Entry (formed @ {timestamp.strftime('%m-%d %H:%M')})"
-
-        if best_fvg is None and not (b == 1 and fvg_bull) and not (b == -1 and fvg_bear) and not has_ob:
+        if best_fvg is None and not (b == 1 and fvg_bull) and not (b == -1 and fvg_bear):
             continue
 
         funnel["FVG/OB Exists"] += 1
 
-        # ── Determine entry and stop ──
+        # ── Determine entry zone ──
         is_bull = (b == 1)
 
         if best_fvg is not None:
-            fvg_btm, fvg_top, fvg_idx, fvg_time = best_fvg
-            entry_key = f"{fvg_time}_{fvg_idx}"
+            fvg_btm, fvg_top, fvg_idx, fvg_time, fvg_kind = best_fvg
+            entry_key = f"{fvg_kind}_{fvg_time}_{fvg_idx}"
         elif fvg_bull and is_bull:
             fvg_btm = fvgs_ltf['fvg_bull_btm'].iloc[i]
             fvg_top = fvgs_ltf['fvg_bull_top'].iloc[i]
-            entry_key = f"{timestamp}_fvg"
-            if not ltf_reason_detail:
-                ltf_reason_detail = f"FVG Formation (zone {fvg_btm:.2f}-{fvg_top:.2f} @ {timestamp.strftime('%m-%d %H:%M')})"
+            entry_key = f"FVG_{timestamp}_{i}"
+            ltf_reason_detail = f"FVG Formation (zone {fvg_btm:.2f}-{fvg_top:.2f} @ {timestamp.strftime('%m-%d %H:%M')})"
         elif fvg_bear and not is_bull:
             fvg_btm = fvgs_ltf['fvg_bear_btm'].iloc[i]
             fvg_top = fvgs_ltf['fvg_bear_top'].iloc[i]
-            entry_key = f"{timestamp}_fvg"
-            if not ltf_reason_detail:
-                ltf_reason_detail = f"FVG Formation (zone {fvg_btm:.2f}-{fvg_top:.2f} @ {timestamp.strftime('%m-%d %H:%M')})"
-        elif has_ob:
-            if is_bull:
-                match = [o for o in ltf_obs_list if o['time'] == timestamp and o['type'] == 'bull']
-            else:
-                match = [o for o in ltf_obs_list if o['time'] == timestamp and o['type'] == 'bear']
-            if not match:
-                continue
-            fvg_btm = match[0]['low']
-            fvg_top = match[0]['high']
-            entry_key = f"{timestamp}_ob"
+            entry_key = f"FVG_{timestamp}_{i}"
+            ltf_reason_detail = f"FVG Formation (zone {fvg_btm:.2f}-{fvg_top:.2f} @ {timestamp.strftime('%m-%d %H:%M')})"
         else:
             continue
 
@@ -952,8 +901,8 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
         if htf_ob:
             confluence = False
             for ob in htf_obs:
-                if not ob['active']:
-                    continue
+                if not ob['active'] or ob['confirm_time'] > decision_time:
+                    continue   # OB not yet confirmed at this point in time
                 dist_pct = min(abs(row['close'] - ob['high']), abs(row['close'] - ob['low'])) / row['close']
                 if dist_pct < 0.01:
                     confluence = True
@@ -966,7 +915,7 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
 
         # ── Clamp bias to current bar (used by P/D filter AND SFP SL) ──
         # Computed once here to avoid duplicate slicing below.
-        bias_slice = df_bias[df_bias.index <= timestamp]
+        bias_slice = df_bias[df_bias.index <= decision_time]   # closed HTF bars only
 
         # ── Premium/Discount filter (1H / 4H Bias Range Focus) ──
         # Relaxed Daily HTF P/D restriction so trend continuation setups aren't blocked on Alts.
@@ -1024,7 +973,8 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
         # Priority: LTF SFP > HTF SFP > FVG boundary fallback
         # Slices are clamped to current bar to prevent look-ahead.
         # ───────────────────────────────────────────────────────
-        entry    = row['close']          # LTF close at the moment of FVG touch
+        # Market order at the LTF close of the touch bar (taker fill + optional slippage)
+        entry    = slip(row['close'], 1 if is_bull else -1, is_entry=True)
         fvg_size = abs(fvg_top - fvg_btm)
 
         # bias_slice already computed above; clamp LTF too
@@ -1105,7 +1055,7 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
         funnel["Valid SL"] += 1
 
         # ── Build the full reason string ──
-        regime = classify_regime(df_daily, timestamp) if df_daily is not None else "ranging"
+        regime = classify_regime(df_daily, decision_time) if df_daily is not None else "ranging"
         train_test = "TEST" if timestamp.strftime("%Y-%m-%d") >= TEST_START else "TRAIN"
 
         # ── Trend-Following Filter (Counter-Trend Block) ──
@@ -1141,22 +1091,22 @@ def simulate_trades(df_ltf: pd.DataFrame, df_bias: pd.DataFrame,
             "_entry_idx": i, "direction": 1 if is_bull else -1,
             "Entry $": round(entry, 8),
             "Stop $": round(stop, 8), "Target $": round(target, 8),
+            "Initial Stop $": round(stop, 8),   # "Stop $" moves to entry at break-even
             "risk_price": round(risk, 8),
             "be_trigger": round(be_trigger, 8),
             "partial_trigger": round(partial_trigger, 8),
             "is_be": False, "be_triggered": False, "r_multiple": 0,
-            "partial_exit_done": False,
+            "partial_exit_done": False, "partial_gross": 0.0, "partial_fee": 0.0,
+            "qty": FIXED_SL_USDT / risk,      # units sized so a full stop-out loses FIXED_SL_USDT (pre-fees)
+            "max_fav_r": 0.0,
             "Entry Type": f"FVG Reaction {'Bull' if is_bull else 'Bear'}",
             "train_test": train_test, "account": account, "Symbol": sym
         }
         funnel["Final Trades"] += 1
         in_trade = True
 
-    # Cleanup old FVGs
-    active_bull_fvgs = [f for f in active_bull_fvgs if len(df_ltf) - f[2] <= 48]
-    active_bear_fvgs = [f for f in active_bear_fvgs if len(df_ltf) - f[2] <= 48]
-
-    return {"trades": trades, "funnel": funnel}
+    # open_trade: position still running at the end of the data (None if flat)
+    return {"trades": trades, "funnel": funnel, "open_trade": current_trade}
 
 
 # ══════════════════════════════════════════════════════════════

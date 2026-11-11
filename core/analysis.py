@@ -149,16 +149,24 @@ def classify_regime(df_weekly_or_daily: pd.DataFrame, entry_time=None) -> str:
 # PRIORITY 5 — Monte Carlo Simulation
 # ══════════════════════════════════════════════════════════════
 
+def profit_factor(pnls) -> float:
+    """Gross profit / gross loss over all trades (inf if there are no losing trades)."""
+    p = pd.Series(pnls, dtype=float)
+    gross_loss = -p[p < 0].sum()
+    return float(p[p > 0].sum() / gross_loss) if gross_loss > 0 else float("inf")
+
+
 def monte_carlo(trades: List[Dict], n_simulations: int = MONTE_CARLO_SIMS,
                 risk_per_trade: float = FIXED_SL_USDT,
                 account_size: float = ACCOUNT_SIZE) -> Dict:
     """
-    Randomly shuffles the order of trade outcomes N times to test
-    whether the strategy's profitability is robust or just lucky.
+    Bootstrap Monte Carlo: each simulation draws len(trades) outcomes WITH
+    replacement from the observed trade PnLs and builds an equity curve.
 
-    WHY: If your trades happened to come in a lucky order, your equity
-    curve looks great — but a different order could wipe you out.
-    Monte Carlo tests ALL possible orderings.
+    WHY bootstrap (not a shuffle): reordering the same trades always ends at
+    the same final balance, so a shuffle can only say something about drawdown.
+    Resampling with replacement asks "if the next N trades look like these,
+    how often do we end up profitable?", which is what the verdict needs.
 
     Returns dict with:
     - profitable_pct: % of simulations that ended profitable
@@ -181,8 +189,8 @@ def monte_carlo(trades: List[Dict], n_simulations: int = MONTE_CARLO_SIMS,
     max_drawdowns = []
 
     for _ in range(n_simulations):
-        # Shuffle the trade order randomly
-        shuffled = rng.permutation(pnls)
+        # Resample trade outcomes with replacement
+        shuffled = rng.choice(pnls, size=len(pnls), replace=True)
 
         # Build equity curve from shuffled trades
         equity_curve = np.cumsum(shuffled) + account_size
@@ -462,9 +470,9 @@ def print_enhanced_stats(trades: List[Dict], funnel: Dict = None,
 
     total_effective = len(wins) + len(losses)
     wr = (len(wins) / total_effective * 100) if total_effective > 0 else 0
-    gross_wins = wins["pnl"].sum()
-    gross_losses = abs(losses["pnl"].sum())
-    pf = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+    # Profit factor over EVERY trade's net PnL (time exits, fee-negative BEs, ...),
+    # not just the WIN / LOSS labelled ones.
+    pf = profit_factor(df_t["pnl"])
 
     # Streaks
     max_win_streak = curr_win = 0
@@ -493,6 +501,11 @@ def print_enhanced_stats(trades: List[Dict], funnel: Dict = None,
     print(f"  Max Loss Streak : {max_loss_streak}")
     print(f"  Max Drawdown    : {max_dd:.1f}%")
     print(f"  Total PnL       : ${df_t['pnl'].sum():.2f}")
+    if "fees" in df_t.columns:
+        print(f"  Fees paid       : ${df_t['fees'].sum():.2f}  ({df_t['fees'].mean() / FIXED_SL_USDT:.2f}R per trade)")
+    other = df_t[~df_t["result"].isin(["WIN", "LOSS", "BE"])]
+    if len(other):
+        print(f"  Other exits     : {other['result'].value_counts().to_dict()}  (PnL ${other['pnl'].sum():.2f})")
 
     # ── REGIME BREAKDOWN (Priority 3) ──
     if "regime" in df_t.columns:
@@ -504,9 +517,7 @@ def print_enhanced_stats(trades: List[Dict], funnel: Dict = None,
             r_wins = (subset["result"] == "WIN").sum()
             r_losses = (subset["result"] == "LOSS").sum()
             r_wr = (r_wins / (r_wins + r_losses) * 100) if (r_wins + r_losses) > 0 else 0
-            r_gw = subset[subset["result"] == "WIN"]["pnl"].sum()
-            r_gl = abs(subset[subset["result"] == "LOSS"]["pnl"].sum())
-            r_pf = r_gw / r_gl if r_gl > 0 else float("inf")
+            r_pf = profit_factor(subset["pnl"])
             print(f"    {regime:<15}: {len(subset):>3} trades | {r_wr:>5.1f}% WR | {r_pf:>5.2f} PF")
 
     # ── MONTHLY BREAKDOWN (Priority 6) ──

@@ -133,6 +133,14 @@ MIN_SL_PCT_BTC            = 0.003
 MIN_SL_PCT_ALTS           = 0.005    # CHANGED to match MIN_SL_DISTANCE config
 MAX_STOP_DISTANCE         = 0.035
 
+# ── EXECUTION COSTS (backtests) ────────────────────
+# Binance USDT-M futures, regular tier. Fees are charged on notional
+# (qty * price) per side, so tight stops with a fixed $ risk mean large
+# positions and fees of ~0.15-0.25R per round trip.
+FEE_TAKER                 = 0.0005    # market entries, stop-loss and time exits
+FEE_MAKER                 = 0.0002    # resting limit orders (limit entries, take-profit)
+SLIPPAGE_PCT              = 0.0       # extra adverse fill on taker fills (e.g. 0.0002 = 2 bps)
+
 # ── UTILITIES ──────────────────────────────────────
 
 
