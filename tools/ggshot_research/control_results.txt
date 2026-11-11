@@ -1,0 +1,53 @@
+GG-Shot v2 control test (tools/ggshot_research/control_test.py)
+finalists: reports/ggshot_v2/20261111_174825/finalists.json; random seeds: [0, 1, 2]; 15 coins x 30m/1h; in = decision_time < 2025-01-01, out = from 2025-01-01
+all = every signal resolved as a standalone trade (heavily overlapping); selected = after the 3-slot / one-per-coin portfolio rule (an exit frees its slot only after its minute)
+random = same number of bars per (coin, tf) sampled from the scan superset, random side
+
+Finalist 1: lookback 20, RSI 55, vol 1; stop atr x 4, 3R, next_open
+  actual       in  all n=159397 avgR=+0.033 win=0.268 | selected n= 753 avgR=+0.132 win=0.292
+    longs      in  all n= 81096 avgR=+0.021            | selected n= 398 avgR=+0.241
+    shorts     in  all n= 78301 avgR=+0.044            | selected n= 355 avgR=+0.009
+  actual       out all n= 77432 avgR=-0.003 win=0.260 | selected n= 406 avgR=+0.086 win=0.281
+    longs      out all n= 36399 avgR=-0.091            | selected n= 199 avgR=+0.054
+    shorts     out all n= 41033 avgR=+0.075            | selected n= 207 avgR=+0.117
+  flipped      in  all n=159397 avgR=-0.073 win=0.238 | selected n= 595 avgR=-0.083 win=0.230
+  flipped      out all n= 77432 avgR=-0.069 win=0.243 | selected n= 314 avgR=-0.074 win=0.245
+  random s0    in  all n=159572 avgR=-0.017 win=0.254 | selected n= 780 avgR=+0.015 win=0.262
+  random s0    out all n= 77257 avgR=-0.043 win=0.250 | selected n= 293 avgR=+0.120 win=0.290
+  random s1    in  all n=159520 avgR=-0.026 win=0.252 | selected n= 686 avgR=-0.014 win=0.254
+  random s1    out all n= 77309 avgR=-0.023 win=0.255 | selected n= 375 avgR=-0.081 win=0.243
+  random s2    in  all n=159508 avgR=-0.026 win=0.252 | selected n= 629 avgR=+0.039 win=0.267
+  random s2    out all n= 77321 avgR=-0.043 win=0.250 | selected n= 350 avgR=-0.080 win=0.243
+
+Finalist 2: lookback 15, RSI 70, vol 1.5; stop swing, 3R, next_open
+  actual       in  all n= 45243 avgR=+0.063 win=0.275 | selected n= 534 avgR=+0.060 win=0.275
+    longs      in  all n= 22546 avgR=+0.082            | selected n= 283 avgR=+0.125
+    shorts     in  all n= 22697 avgR=+0.045            | selected n= 251 avgR=-0.013
+  actual       out all n= 21462 avgR=+0.049 win=0.273 | selected n= 308 avgR=+0.246 win=0.325
+    longs      out all n= 10064 avgR=-0.033            | selected n= 155 avgR=+0.267
+    shorts     out all n= 11398 avgR=+0.121            | selected n= 153 avgR=+0.224
+  flipped      in  all n= 49197 avgR=-0.195 win=0.227 | selected n=9409 avgR=-0.164 win=0.235
+  flipped      out all n= 23957 avgR=-0.174 win=0.239 | selected n=4785 avgR=-0.203 win=0.236
+  random s0    in  all n= 48420 avgR=-0.084 win=0.250 | selected n=1985 avgR=+0.000 win=0.269
+  random s0    out all n= 23606 avgR=-0.102 win=0.250 | selected n= 845 avgR=-0.077 win=0.256
+  random s1    in  all n= 48683 avgR=-0.067 win=0.254 | selected n= 830 avgR=+0.029 win=0.275
+  random s1    out all n= 23332 avgR=-0.121 win=0.245 | selected n= 758 avgR=-0.061 win=0.259
+  random s2    in  all n= 48687 avgR=-0.092 win=0.248 | selected n=1695 avgR=-0.121 win=0.238
+  random s2    out all n= 23352 avgR=-0.106 win=0.249 | selected n= 330 avgR=+0.001 win=0.273
+
+Finalist 3: lookback 15, RSI 55, vol 1.5; stop atr x 4, 3R, confirm 30 min / 0.25 ATR
+  actual       in  all n= 76489 avgR=+0.051 win=0.272 | selected n= 864 avgR=+0.094 win=0.282
+    longs      in  all n= 37848 avgR=+0.042            | selected n= 466 avgR=+0.153
+    shorts     in  all n= 38641 avgR=+0.060            | selected n= 398 avgR=+0.025
+  actual       out all n= 36254 avgR=-0.002 win=0.260 | selected n= 374 avgR=+0.087 win=0.283
+    longs      out all n= 16968 avgR=-0.098            | selected n= 186 avgR=+0.011
+    shorts     out all n= 19286 avgR=+0.083            | selected n= 188 avgR=+0.162
+  flipped      in  all n= 79591 avgR=-0.080 win=0.237 | selected n= 607 avgR=-0.190 win=0.208
+  flipped      out all n= 37998 avgR=-0.079 win=0.241 | selected n= 257 avgR=-0.238 win=0.198
+  random s0    in  all n= 75981 avgR=-0.023 win=0.252 | selected n= 748 avgR=+0.022 win=0.263
+  random s0    out all n= 36085 avgR=-0.046 win=0.249 | selected n= 312 avgR=-0.121 win=0.231
+  random s1    in  all n= 75983 avgR=-0.030 win=0.251 | selected n= 814 avgR=-0.039 win=0.248
+  random s1    out all n= 36068 avgR=-0.047 win=0.249 | selected n= 413 avgR=-0.099 win=0.237
+  random s2    in  all n= 76006 avgR=-0.021 win=0.253 | selected n= 862 avgR=-0.050 win=0.245
+  random s2    out all n= 36206 avgR=-0.055 win=0.247 | selected n= 373 avgR=-0.105 win=0.236
+
