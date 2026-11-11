@@ -277,3 +277,185 @@ def test_htf_filter_uses_only_closed_4h_bars():
     # no 4h data, or none closed yet, gives False
     assert not det.scan(bars, None).htf_ok.any()
     assert not htf_at_last(frame(np.array([100.0]), [t - pd.Timedelta(hours=1)]))
+
+
+# ------------------------------------------------------------------- trades
+
+from models.ggshot_v2 import trades  # noqa: E402
+
+T0 = pd.Timestamp("2024-01-01 00:00", tz="UTC")
+SLIP, TAKER, MAKER = 0.0002, 0.0005, 0.0002
+
+
+def _sig(side=1, close=100.0, atr=1.0, start=T0, **kw):
+    row = dict(signal_time=start - pd.Timedelta(hours=1), decision_time=start, side=side,
+               close=close, atr=atr, swing_low=np.nan, swing_high=np.nan, st_line=np.nan)
+    row.update(kw)
+    return pd.DataFrame([row])
+
+
+def _m1_bars(bars, start=T0):
+    """1m frame from explicit (open, high, low, close) tuples, one per minute."""
+    idx = pd.date_range(start, periods=len(bars), freq="1min", tz="UTC")
+    o, h, l, c = zip(*bars)
+    return pd.DataFrame({"open": o, "high": h, "low": l, "close": c,
+                         "volume": np.ones(len(bars))}, index=idx)
+
+
+def _m1_path(closes, start=T0):
+    """Minute i opens at the previous close (the first at closes[0]) and closes at closes[i]."""
+    bars, prev = [], closes[0]
+    for c in closes:
+        bars.append((prev, max(prev, c), min(prev, c), c))
+        prev = c
+    return _m1_bars(bars, start)
+
+
+def _no_funding():
+    return pd.Series([], index=pd.DatetimeIndex([], tz="UTC"), dtype=float)
+
+
+def test_long_hits_target_with_exact_costs():
+    t = trades.resolve_trades(_sig(side=1, close=100, atr=1.0), _m1_path([100, 100.5, 104.5]),
+                              _no_funding(), trades.TradeSpec("atr", 2.0, 2.0), "BTCUSDT", "1h").iloc[0]
+    e = 100 * 1.0002
+    assert t.entry_px == pytest.approx(e) and t.stop_px == pytest.approx(e - 2.0)
+    assert t.target_px == pytest.approx(e + 4.0) and t.risk_px == pytest.approx(2.0)
+    assert t.exit_reason == "TP" and t.exit_px == pytest.approx(e + 4.0)
+    assert t.exit_time == T0 + pd.Timedelta(minutes=2) and t.entry_time == T0
+    assert t.r_gross == pytest.approx(2.0)
+    assert t.r_fee == pytest.approx((0.0005 * e + 0.0002 * (e + 4.0)) / 2.0)
+    assert t.r_funding == 0.0
+    assert t.r_net == pytest.approx(2.0 - t.r_fee)
+    assert t.notional_per_risk == pytest.approx(e / 2.0)
+    assert (t.symbol, t.tf, t.side) == ("BTCUSDT", "1h", 1)
+
+
+def test_short_hits_target_mirrored():
+    t = trades.resolve_trades(_sig(side=-1), _m1_path([100, 99.5, 95.5]), _no_funding(),
+                              trades.TradeSpec("atr", 2.0, 2.0), "BTCUSDT", "1h").iloc[0]
+    e = 100 * 0.9998
+    assert t.entry_px == pytest.approx(e) and t.stop_px == pytest.approx(e + 2.0)
+    assert t.exit_reason == "TP" and t.exit_px == pytest.approx(e - 4.0)
+    assert t.r_gross == pytest.approx(2.0)
+
+
+def test_stop_wins_when_both_in_same_minute():
+    bars = [(100, 100, 100, 100), (100, 105, 97, 100)]   # low < stop 98.02 and high > target 104.02
+    t = trades.resolve_trades(_sig(), _m1_bars(bars), _no_funding(),
+                              trades.TradeSpec("atr", 2.0, 2.0), "X", "1h").iloc[0]
+    e = 100.02
+    assert t.exit_reason == "SL" and t.exit_px == pytest.approx((e - 2.0) * (1 - SLIP))
+    assert t.r_gross == pytest.approx((t.exit_px - e) / 2.0)
+    assert t.r_fee == pytest.approx((TAKER * e + TAKER * t.exit_px) / 2.0)
+
+
+def test_gap_through_stop_fills_at_open():
+    bars = [(100, 100, 100, 100), (95, 95.5, 94.5, 95)]    # opens 3 below the 98.02 stop
+    t = trades.resolve_trades(_sig(), _m1_bars(bars), _no_funding(),
+                              trades.TradeSpec("atr", 2.0, 2.0), "X", "1h").iloc[0]
+    assert t.exit_reason == "SL" and t.exit_px == pytest.approx(95 * (1 - SLIP))
+    assert t.r_gross == pytest.approx((95 * (1 - SLIP) - 100.02) / 2.0)
+    assert t.r_net < -1.0
+
+
+def test_confirm_entry_triggers_or_skips():
+    spec = trades.TradeSpec("atr", 2.0, 2.0, entry="confirm", confirm_minutes=15, confirm_atr=0.5)
+    # trigger L = 100.5 reached in minute 7 (open 100 below L -> fills at L)
+    t = trades.resolve_trades(_sig(), _m1_path([100] * 7 + [100.6, 100.6, 104.6]), _no_funding(),
+                              spec, "X", "1h").iloc[0]
+    assert t.entry_time == T0 + pd.Timedelta(minutes=7)
+    assert t.entry_px == pytest.approx(100.5 * (1 + SLIP))
+    # bar opening already beyond L fills at its open
+    bars = [(100, 100, 100, 100)] * 3 + [(101, 101.2, 100.9, 101), (101, 101, 101, 101)]
+    t = trades.resolve_trades(_sig(), _m1_bars(bars), _no_funding(), spec, "X", "1h").iloc[0]
+    assert t.entry_px == pytest.approx(101 * (1 + SLIP)) and t.entry_time == T0 + pd.Timedelta(minutes=3)
+    # never reached -> no row; reached only at minute 15 (outside [0, 15)) -> no row
+    assert trades.resolve_trades(_sig(), _m1_path([100] * 30), _no_funding(), spec, "X", "1h").empty
+    late = _m1_path([100] * 15 + [100.6] * 5)
+    assert trades.resolve_trades(_sig(), late, _no_funding(), spec, "X", "1h").empty
+    # short mirror: L = 99.5
+    s = trades.resolve_trades(_sig(side=-1), _m1_path([100] * 4 + [99.4, 99.4]), _no_funding(),
+                              spec, "X", "1h").iloc[0]
+    assert s.entry_px == pytest.approx(99.5 * (1 - SLIP)) and s.entry_time == T0 + pd.Timedelta(minutes=4)
+
+
+def test_structural_stop_guards():
+    m1 = _m1_path([100, 100.5, 101])
+    sw = trades.TradeSpec("swing", 0.0, 2.0)
+    e = 100.02
+    # swing 0.32 ATR away -> widened to 1.0 ATR
+    t = trades.resolve_trades(_sig(swing_low=99.7), m1, _no_funding(), sw, "X", "1h").iloc[0]
+    assert t.stop_px == pytest.approx(e - 1.0) and t.risk_px == pytest.approx(1.0)
+    # swing inside 1..6 ATR is kept as is
+    t = trades.resolve_trades(_sig(swing_low=97.02), m1, _no_funding(), sw, "X", "1h").iloc[0]
+    assert t.stop_px == pytest.approx(97.02) and t.risk_px == pytest.approx(3.0)
+    # above a long entry / 8 ATR away -> no row
+    assert trades.resolve_trades(_sig(swing_low=100.5), m1, _no_funding(), sw, "X", "1h").empty
+    assert trades.resolve_trades(_sig(swing_low=92.0), m1, _no_funding(), sw, "X", "1h").empty
+    st = trades.TradeSpec("supertrend", 0.0, 2.0)
+    assert trades.resolve_trades(_sig(st_line=100.5), m1, _no_funding(), st, "X", "1h").empty
+    t = trades.resolve_trades(_sig(st_line=98.02), m1, _no_funding(), st, "X", "1h").iloc[0]
+    assert t.stop_px == pytest.approx(98.02)
+    # short: swing_high 0.52 away -> widened to 1.0 ATR above entry
+    t = trades.resolve_trades(_sig(side=-1, swing_high=100.5), _m1_path([100, 99.5, 99]), _no_funding(),
+                              sw, "X", "1h").iloc[0]
+    assert t.stop_px == pytest.approx(100 * (1 - SLIP) + 1.0)
+    assert trades.resolve_trades(_sig(side=-1, swing_high=99.0), _m1_path([100, 99.5, 99]), _no_funding(),
+                                 sw, "X", "1h").empty
+
+
+def _funding_case(side, last_close):
+    start = pd.Timestamp("2024-01-01 07:30", tz="UTC")
+    m1 = _m1_path([100.0] * 540 + [last_close], start)          # target hit at 16:30
+    marks = pd.DatetimeIndex(["2024-01-01 08:00:00.006", "2024-01-01 16:00:00.006",
+                              "2024-01-02 00:00:00.006"], tz="UTC")
+    fund = pd.Series([0.0001] * 3, index=marks)
+    t = trades.resolve_trades(_sig(side=side, start=start), m1, fund,
+                              trades.TradeSpec("atr", 2.0, 2.0), "X", "1h").iloc[0]
+    assert t.exit_reason == "TP" and t.exit_time == pd.Timestamp("2024-01-01 16:30", tz="UTC")
+    return t
+
+
+def test_funding_charged_only_inside_trade():
+    t = _funding_case(1, 104.5)
+    assert t.r_funding == pytest.approx(-2 * 0.0001 * t.entry_px / t.risk_px)
+    assert t.r_net == pytest.approx(t.r_gross - t.r_fee + t.r_funding)
+    s = _funding_case(-1, 95.5)
+    assert s.r_funding == pytest.approx(2 * 0.0001 * s.entry_px / s.risk_px)
+
+
+def test_open_at_data_end_is_closed_as_END():
+    t = trades.resolve_trades(_sig(), _m1_path([100, 100.5, 101]), _no_funding(),
+                              trades.TradeSpec("atr", 2.0, 2.0), "X", "1h").iloc[0]
+    e = 100.02
+    assert t.exit_reason == "END" and t.exit_px == pytest.approx(101 * (1 - SLIP))
+    assert t.exit_time == T0 + pd.Timedelta(minutes=2)
+    assert t.r_gross == pytest.approx((t.exit_px - e) / 2.0)
+    assert t.r_fee == pytest.approx((TAKER * e + TAKER * t.exit_px) / 2.0)
+
+
+def test_search_window_doubles_beyond_30_days():
+    closes = [100.0] * 50000 + [104.5]
+    t = trades.resolve_trades(_sig(), _m1_path(closes), _no_funding(),
+                              trades.TradeSpec("atr", 2.0, 2.0), "X", "1h").iloc[0]
+    assert t.exit_reason == "TP" and t.exit_time == T0 + pd.Timedelta(minutes=50000)
+
+
+def test_missing_minutes_and_index_preserved():
+    full = _m1_path([100.0, 100.5, 104.5] * 3 + [104.5] * 20)
+    late = full.drop(full.index[:7])                  # first bar opens 7 min after decision
+    spec = trades.TradeSpec("atr", 2.0, 2.0)
+    assert trades.resolve_trades(_sig(), late, _no_funding(), spec, "X", "1h").empty
+    near = full.drop(full.index[:3])                  # 3 min later -> entry uses that bar
+    t = trades.resolve_trades(_sig(), near, _no_funding(), spec, "X", "1h").iloc[0]
+    assert t.entry_time == T0 + pd.Timedelta(minutes=3)
+    sigs = pd.concat([_sig(), _sig(close=1000.0, atr=1.0), _sig(side=-1)], ignore_index=True)
+    sigs.index = [10, 20, 30]
+    out = trades.resolve_trades(sigs, _m1_path([100, 100.5, 104.5]), _no_funding(), spec, "X", "1h")
+    assert list(out.index) == [10, 20, 30]           # all valid (price mismatch is harmless here)
+    sw = trades.TradeSpec("swing", 0.0, 2.0)
+    sigs["swing_low"] = [99.0, np.nan, np.nan]       # only the first long has a usable stop
+    sigs["swing_high"] = [np.nan, np.nan, 101.0]
+    out = trades.resolve_trades(sigs, _m1_path([100, 100.5, 104.5]), _no_funding(), sw, "X", "1h")
+    assert list(out.index) == [10, 30]
