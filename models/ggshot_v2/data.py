@@ -83,29 +83,44 @@ def _fetch_zip(url, dest):
     return True
 
 
+def _write_tail(df, dest, ok):
+    """Atomically replace a tail file; keep the existing one if the fetch errored or was empty."""
+    if not ok or (df.empty and os.path.exists(dest)):
+        log.warning("tail fetch failed or empty, keeping existing %s", dest)
+        return
+    tmp = dest + ".part"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, dest)
+
+
 def _tail_klines(symbol, since_ms, dest):
-    rows, t = [], since_ms
+    rows, t, ok = [], since_ms, True
     while True:
         _pause()
         resp = _get(f"{API}/klines", {"symbol": symbol, "interval": "1m",
                                       "startTime": t, "limit": 1500})
-        batch = resp.json() if resp is not None and resp.status_code == 200 else []
+        if resp is None or resp.status_code != 200:
+            ok = False
+            break
+        batch = resp.json()
         if not batch:
             break
         rows.extend(batch)
         t = batch[-1][0] + 60_000
         if len(batch) < 1500:
             break
-    df = pd.DataFrame([r[:12] for r in rows], columns=KLINE_COLS)
-    df.to_csv(dest, index=False)
+    _write_tail(pd.DataFrame([r[:12] for r in rows], columns=KLINE_COLS), dest, ok)
 
 
 def _tail_funding(symbol, since_ms, dest):
-    rows, t = [], since_ms
+    rows, t, ok = [], since_ms, True
     while True:
         _pause()
         resp = _get(f"{API}/fundingRate", {"symbol": symbol, "startTime": t, "limit": 1000})
-        batch = resp.json() if resp is not None and resp.status_code == 200 else []
+        if resp is None or resp.status_code != 200:
+            ok = False
+            break
+        batch = resp.json()
         if not batch:
             break
         rows.extend(batch)
@@ -116,7 +131,7 @@ def _tail_funding(symbol, since_ms, dest):
                        "funding_interval_hours": 8,
                        "last_funding_rate": [float(r["fundingRate"]) for r in rows]},
                       columns=FUNDING_COLS)
-    df.to_csv(dest, index=False)
+    _write_tail(df, dest, ok)
 
 
 def download(symbols, start):

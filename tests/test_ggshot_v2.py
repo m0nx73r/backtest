@@ -126,3 +126,23 @@ def test_load_funding(monkeypatch, tmp_path):
 def test_config_constants():
     assert len(config.COINS) == 15 and config.COINS[0] == "BTCUSDT" and config.COINS[-1] == "FILUSDT"
     assert config.TIMEFRAMES == ["1h", "30m"] and config.FEE_TAKER > config.FEE_MAKER
+
+
+def test_errored_tail_fetch_keeps_existing_tail(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(data, "PAUSE", 0.0)
+    raw = tmp_path / "raw" / "BTCUSDT"
+    raw.mkdir(parents=True)
+    (raw / "tail_1m.csv").write_text("GOOD-KLINES\n")
+    (raw / "tail_funding.csv").write_text("GOOD-FUNDING\n")
+
+    def fake_get(url, params=None):
+        if url.startswith("https://fapi.binance.com"):
+            return None if "klines" in url else _Resp(500)   # retries exhausted / server error
+        return _Resp(404)
+
+    monkeypatch.setattr(data, "_get", fake_get)
+    data.download(["BTCUSDT"], "2026-10-01")
+    assert (raw / "tail_1m.csv").read_text() == "GOOD-KLINES\n"
+    assert (raw / "tail_funding.csv").read_text() == "GOOD-FUNDING\n"
+    assert not list(raw.glob("*.part"))
