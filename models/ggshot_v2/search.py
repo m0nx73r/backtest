@@ -20,6 +20,7 @@ from . import data, metrics
 from . import store as store_mod
 from .config import (BOOTSTRAP_RUNS, COINS, MAX_FINALISTS, MIN_IS_TRADES, REPORT_DIR, RISK_USD,
                      RISK_USD_ALT, SPLIT, TIMEFRAMES, TRADE_CACHE_DIR)
+from . import trades as trades_mod
 from .store import TradeStore
 from .detector import DetectorParams, apply_params, scan
 from .portfolio import select_trades
@@ -61,6 +62,13 @@ def _in_period(df, period):
 
 # --------------------------------------------------------------------------- trades
 
+def _fingerprint(m1, funding):
+    """Identity of everything a cached trade depends on besides code: the coin's data and costs."""
+    return (str(m1.index[-1]) if len(m1) else None, len(m1),
+            str(funding.index[-1]) if len(funding) else None,
+            trades_mod.FEE_TAKER, trades_mod.FEE_MAKER, trades_mod.SLIPPAGE)
+
+
 def _build_coin(sym, specs, timeframes, store_dir, period, loaders, label=""):
     """Scan + resolve + write every not-yet-done (coin, tf) of one symbol; returns small status.
 
@@ -70,13 +78,14 @@ def _build_coin(sym, specs, timeframes, store_dir, period, loaders, label=""):
     load_1m, load_funding = loaders or (data.load_1m, data.load_funding)
     st = TradeStore(store_dir, specs, [(sym, tf) for tf in timeframes], TRADE_COLUMNS + FEATURES,
                     period)
-    todo = [tf for tf in timeframes if not st.is_done(sym, tf)]
+    m1, funding = load_1m(sym), load_funding(sym)
+    fp = _fingerprint(m1, funding)
+    todo = [tf for tf in timeframes if not st.is_done(sym, tf, fp)]
     for tf in timeframes:
         if tf not in todo:
             _log(f"{label}{sym} {tf}: skip (cached)", t0)
     signals = {}
     if todo:
-        m1, funding = load_1m(sym), load_funding(sym)
         bars_4h = data.resample(m1, "4h")
         for tf in todo:
             st.begin(sym, tf)
@@ -84,10 +93,11 @@ def _build_coin(sym, specs, timeframes, store_dir, period, loaders, label=""):
             for spec in specs:
                 tr = _in_period(resolve_trades(sc, m1, funding, spec, sym, tf), period)
                 st.write(sym, tf, spec, tr.join(sc[FEATURES]) if len(tr) else tr.iloc[:0])
-            st.finish(sym, tf)
+            st.finish(sym, tf, fp)
             signals[tf] = len(sc)
             _log(f"{label}{sym} {tf}: {len(sc)} signals x {len(specs)} specs", t0)
-        del m1, funding, bars_4h
+        del bars_4h
+    del m1, funding
     return {"symbol": sym, "built": signals, "skipped": [tf for tf in timeframes if tf not in todo],
             "seconds": round(time.time() - t0, 1)}
 

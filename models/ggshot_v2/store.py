@@ -14,6 +14,9 @@ import pandas as pd
 
 TIME_COLUMNS = ["signal_time", "decision_time", "entry_time", "exit_time"]
 DONE = "_done"
+# Bump by hand whenever scan / resolve_trades / detector logic changes: cached trades from an
+# older version are then rebuilt. (Data identity and cost constants are fingerprinted automatically.)
+STORE_VERSION = 1
 
 
 def spec_key(spec):
@@ -44,10 +47,13 @@ class TradeStore(Mapping):
     def pair_dir(self, sym, tf):
         return self.root / f"{sym}_{tf}"
 
-    def is_done(self, sym, tf):
+    def _stamp(self, fingerprint):
+        return repr((self.period, STORE_VERSION, fingerprint))
+
+    def is_done(self, sym, tf, fingerprint=None):
         d = self.pair_dir(sym, tf)
         marker = d / DONE
-        if not marker.is_file() or marker.read_text() != repr(self.period):
+        if not marker.is_file() or marker.read_text() != self._stamp(fingerprint):
             return False
         return all((d / f"{spec_key(s)}.pkl").is_file() for s in self._specs)
 
@@ -65,10 +71,10 @@ class TradeStore(Mapping):
         if (d / DONE).exists():
             (d / DONE).unlink()
 
-    def finish(self, sym, tf):
+    def finish(self, sym, tf, fingerprint=None):
         marker = self.pair_dir(sym, tf) / DONE
         part = marker.with_name(DONE + ".part")
-        part.write_text(repr(self.period))
+        part.write_text(self._stamp(fingerprint))
         os.replace(part, marker)
 
     # ---- reading (Mapping)

@@ -1013,3 +1013,42 @@ def test_store_parallel_build_equals_serial(synthetic, tmp_path):
     again = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "p", workers=2,
                                 loaders=None)   # all cached: loaders unused
     assert len(again[TINY_SPECS[0]]) == len(par[TINY_SPECS[0]])
+
+
+def _count_resolves(monkeypatch):
+    calls, real = [], search.resolve_trades
+
+    def spy(sc, m1, funding, spec, sym, tf):
+        calls.append((sym, tf))
+        return real(sc, m1, funding, spec, sym, tf)
+
+    monkeypatch.setattr(search, "resolve_trades", spy)
+    return calls
+
+
+def test_store_unchanged_inputs_skip_but_changed_data_or_costs_rebuild(synthetic, tmp_path, monkeypatch):
+    sd = tmp_path / "st"
+    search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    calls = _count_resolves(monkeypatch)
+    search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    assert calls == []                                     # same data, same costs: all cached
+    # newer/shorter 1m data for one coin: only that coin's pairs rebuild
+    monkeypatch.setattr(search.data, "load_1m", lambda s: _synthetic_1m(s).iloc[:-1]
+                        if s == SYN_COINS[1] else _synthetic_1m(s))
+    search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    assert {c[0] for c in calls} == {SYN_COINS[1]} and len(calls) == len(TINY_SPECS) * 2
+    calls.clear()
+    search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    assert calls == []
+    monkeypatch.setattr(search.trades_mod, "SLIPPAGE", 0.0005)   # cost change: everything rebuilds
+    search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    assert len(calls) == len(TINY_SPECS) * 4
+
+
+def test_store_version_bump_rebuilds(synthetic, tmp_path, monkeypatch):
+    sd = tmp_path / "st"
+    search.build_trades(SYN_COINS[:1], specs=TINY_SPECS, store_dir=sd)
+    calls = _count_resolves(monkeypatch)
+    monkeypatch.setattr(store_mod, "STORE_VERSION", store_mod.STORE_VERSION + 1)
+    search.build_trades(SYN_COINS[:1], specs=TINY_SPECS, store_dir=sd)
+    assert len(calls) == len(TINY_SPECS) * 2
