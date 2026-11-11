@@ -4,14 +4,15 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Set PYTHONPATH to project root
-sys.path.insert(0, 'e:/backtest')
+# Resolve project root relative to this file (tools/ -> repo root)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from models.backtest_cisd import simulate_trades, fetch_ohlcv_full, detect_sfp_pattern
 from core.config import DAYS_BACK, ALIGNMENTS, ACTIVE_CHAIN
 
-# Set artifact folder path for saving images
-ARTIFACT_DIR = r"C:\Users\hardi\.gemini\antigravity\brain\69fd3186-4cee-4d0c-b13d-731efec73aa0"
+# Output folder for failed-trade plots (exports/ is gitignored)
+ARTIFACT_DIR = os.path.join(PROJECT_ROOT, "exports", "failed_trades")
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
 def generate_failed_trade_plots():
