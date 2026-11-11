@@ -916,8 +916,8 @@ def test_run_cli_dispatch(monkeypatch, capsys):
     monkeypatch.setattr(run.search, "search", lambda: seen.append(("search",)))
     run.main(["download"])
     run.main(["search"])
+    monkeypatch.setattr(run, "sanity", lambda: seen.append(("sanity",)))
     run.main(["sanity"])
-    assert seen == [("dl", config.COINS, config.START), ("search",)]
-    assert "Task 8" in capsys.readouterr().out
+    assert seen == [("dl", config.COINS, config.START), ("search",), ("sanity",)]
     with pytest.raises(SystemExit):
         run.main([])
