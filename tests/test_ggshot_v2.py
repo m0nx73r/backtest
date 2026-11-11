@@ -686,3 +686,238 @@ def test_verdict_requires_all_gates():
         v = metrics.verdict(summary, {**robust, k: False}, 0.7)
         assert v[k] is False and v["passed"] is False
     assert metrics.verdict({**summary, "win_rate": 0.40}, robust, 0.65)["passed"] is True
+
+
+# ------------------------------------------------------------------- portfolio speed-up (Task 7)
+
+def _reference_select(trades, max_open=config.MAX_OPEN):
+    """Original per-row implementation of portfolio.select_trades (behaviour oracle)."""
+    tf_rank = {tf: i for i, tf in enumerate(config.TIMEFRAMES)}
+    coin_rank = {c: i for i, c in enumerate(config.COINS)}
+    order = sorted(
+        range(len(trades)),
+        key=lambda i: (trades["entry_time"].iloc[i],
+                       tf_rank.get(trades["tf"].iloc[i], len(tf_rank)),
+                       coin_rank.get(trades["symbol"].iloc[i], len(coin_rank)), i))
+    open_trades, accepted = [], []
+    for i in order:
+        entry, symbol = trades["entry_time"].iloc[i], trades["symbol"].iloc[i]
+        open_trades = [o for o in open_trades if o[0] > entry]
+        if len(open_trades) < max_open and all(o[1] != symbol for o in open_trades):
+            accepted.append(i)
+            open_trades.append((trades["exit_time"].iloc[i], symbol))
+    return trades.iloc[accepted].copy()
+
+
+def test_select_trades_matches_reference_on_random_frames():
+    rng = np.random.default_rng(7)
+    symbols = config.COINS[:5] + ["ZZZUSDT"]              # includes an unknown coin
+    for _ in range(300):
+        n = int(rng.integers(1, 40))
+        rows = [_t(str(rng.choice(symbols)), str(rng.choice(["1h", "30m", "4h"])), int(e),
+                   int(e) + int(rng.integers(1, 120)), r_net=float(rng.normal()))
+                for e in rng.integers(0, 40, n) * 10]      # many equal entry times
+        df = _frame(rows, index=rng.permutation(1000)[:n])
+        mo = int(rng.integers(1, 5))
+        pd.testing.assert_frame_equal(portfolio.select_trades(df, max_open=mo),
+                                      _reference_select(df, max_open=mo))
+    empty = _frame([_t("BTCUSDT", "1h", 0, 10)]).iloc[:0]
+    pd.testing.assert_frame_equal(portfolio.select_trades(empty), _reference_select(empty))
+
+
+# ------------------------------------------------------------------- search (Task 7)
+
+import json  # noqa: E402
+
+from models.ggshot_v2 import search  # noqa: E402
+
+SPLIT_TS = pd.Timestamp(config.SPLIT, tz="UTC")
+_SYN_CACHE = {}
+
+
+def _synthetic_1m(symbol):
+    """Trending-regime random walk of 1m bars spanning SPLIT (deterministic per symbol)."""
+    if symbol not in _SYN_CACHE:
+        rng = np.random.default_rng(sum(map(ord, symbol)))
+        idx = pd.date_range("2024-10-20", "2025-02-10", freq="1min", tz="UTC", inclusive="left")
+        n = len(idx)
+        regime = np.repeat(rng.choice([-1.0, 1.0], n // 2880 + 1), 2880)[:n]
+        close = 100 * np.exp(np.cumsum(regime * 0.00004 + rng.normal(0, 0.0008, n)))
+        open_ = np.concatenate([[close[0]], close[:-1]])
+        wig = np.abs(rng.normal(0, 0.0004, n)) * close
+        _SYN_CACHE[symbol] = pd.DataFrame({
+            "open": open_, "high": np.maximum(open_, close) + wig,
+            "low": np.minimum(open_, close) - wig, "close": close,
+            "volume": rng.gamma(2.0, 5.0, n)}, index=idx)
+    return _SYN_CACHE[symbol]
+
+
+def _synthetic_funding(symbol):
+    idx = pd.date_range("2024-10-20", "2025-02-10", freq="8h", tz="UTC")
+    return pd.Series(0.0001, index=idx, name="funding_rate")
+
+
+SYN_COINS = ["BTCUSDT", "ETHUSDT"]
+TINY_DET = [det.DetectorParams(lookback=15, rsi_level=55.0, vol_mult=1.0)]
+TINY_SPECS = [trades.TradeSpec("atr", 2.0, 2.0),
+              trades.TradeSpec("atr", 2.0, 2.0, entry="confirm", confirm_minutes=15, confirm_atr=0.25)]
+
+
+@pytest.fixture
+def synthetic(monkeypatch, tmp_path):
+    monkeypatch.setattr(search.data, "load_1m", _synthetic_1m)
+    monkeypatch.setattr(search.data, "load_funding", _synthetic_funding)
+    monkeypatch.setattr(search, "MIN_IS_TRADES", 5)
+    monkeypatch.setattr(search, "BOOTSTRAP_RUNS", 200)
+    monkeypatch.setattr(search, "REPORT_DIR", str(tmp_path / "reports"))
+    return tmp_path
+
+
+def test_grid_sizes():
+    assert len(search.GRID_DETECTOR) == 48 and len(set(search.GRID_DETECTOR)) == 48
+    assert len(search.GRID_TRADE) == 84 and len(set(search.GRID_TRADE)) == 84
+    assert all(not (p.htf_trend or p.max_run_atr or p.hours or p.atr_pct_range)
+               for p in search.GRID_DETECTOR)
+    assert sum(s.entry == "next_open" for s in search.GRID_TRADE) == 12
+
+
+def _ranked(cfgs, avg_rs):
+    return pd.DataFrame({"cfg": cfgs, "n": 500, "avg_r": avg_rs,
+                         "rank": np.arange(1, len(cfgs) + 1, dtype=float)})
+
+
+def test_pick_finalists_reserves_confirm_slot():
+    d = det.DetectorParams()
+    nxt = [(d, trades.TradeSpec("atr", k, 2.0)) for k in (1.5, 2.0, 3.0, 4.0)]
+    conf = (d, trades.TradeSpec("atr", 2.0, 2.0, "confirm", 5, 0.25))
+    ranked = _ranked(nxt + [conf], [0.5, 0.4, 0.3, 0.2, 0.1])
+    assert search.pick_finalists(ranked) == [nxt[0], nxt[1], conf]
+    assert len(search.pick_finalists(ranked)) <= config.MAX_FINALISTS
+    # no qualifying confirm config -> fewer finalists, never a third next_open
+    assert search.pick_finalists(ranked.iloc[:4]) == [nxt[0], nxt[1]]
+    unranked = ranked.copy()
+    unranked.loc[4, "rank"] = np.nan                      # ineligible rows are never picked
+    assert search.pick_finalists(unranked) == [nxt[0], nxt[1]]
+    assert search.pick_finalists(ranked.iloc[:0]) == []
+
+
+def _trade_frame(n, r, start="2022-01-01", symbol="BTCUSDT"):
+    """n non-overlapping in-sample trades with constant r_net."""
+    ent = pd.Timestamp(start, tz="UTC") + pd.to_timedelta(np.arange(n) * 120, unit="min")
+    return pd.DataFrame({"symbol": symbol, "tf": "1h", "side": 1, "decision_time": ent,
+                         "entry_time": ent, "exit_time": ent + pd.Timedelta(minutes=60),
+                         "r_net": float(r), "notional_per_risk": 50.0})
+
+
+def test_rank_ignores_configs_below_min_trades():
+    d = det.DetectorParams()
+    few, many_lo, many_hi = ((d, trades.TradeSpec("atr", k, 2.0)) for k in (1.5, 2.0, 3.0))
+    m = config.MIN_IS_TRADES
+    ranked = search.rank_in_sample({few: _trade_frame(m - 1, 2.0),
+                                    many_lo: _trade_frame(m, 0.1),
+                                    many_hi: _trade_frame(m + 10, 0.3)}, config.RISK_USD)
+    assert list(ranked["cfg"]) == [many_hi, many_lo, few]
+    assert list(ranked["rank"].iloc[:2]) == [1.0, 2.0] and np.isnan(ranked["rank"].iloc[2])
+    assert {"n", "win_rate", "avg_r", "pf", "max_dd_pct", "challenge"} <= set(ranked.columns)
+    assert list(ranked["n"]) == [m + 10, m, m - 1]
+    assert search.pick_finalists(ranked) == [many_hi, many_lo]
+
+
+def test_build_trades_and_trades_for(synthetic):
+    by_spec = search.build_trades(SYN_COINS, specs=TINY_SPECS)
+    assert set(by_spec) == set(TINY_SPECS)
+    for df in by_spec.values():
+        assert df.index.is_unique and len(df) > 0
+        assert set(df["symbol"]) == set(SYN_COINS) and set(df["tf"]) == set(config.TIMEFRAMES)
+        assert {"ext15", "ext30", "rsi", "vol_ratio", "htf_ok", "run10_atr", "atr_pct",
+                "hour"} <= set(df.columns)
+        assert (df["decision_time"] >= SPLIT_TS).any() and (df["decision_time"] < SPLIT_TS).any()
+    spec = TINY_SPECS[0]
+    cfg = (det.DetectorParams(lookback=20, rsi_level=60.0), spec)
+    full = det.apply_params(by_spec[spec], cfg[0])
+    ins, oos = (search.trades_for(cfg, by_spec, p) for p in ("in", "out"))
+    assert len(ins) and len(oos)
+    assert (ins["decision_time"] < SPLIT_TS).all() and (oos["decision_time"] >= SPLIT_TS).all()
+    assert sorted(ins.index.append(oos.index)) == sorted(full.index)
+    assert search.trades_for(cfg, by_spec, None).index.equals(full.index)
+    only_in = search.build_trades(SYN_COINS[:1], period="in", specs=TINY_SPECS[:1])
+    assert len(only_in[spec]) and (only_in[spec]["decision_time"] < SPLIT_TS).all()
+
+
+def test_oos_never_feeds_selection(synthetic, monkeypatch):
+    calls, built = [], {}
+    real_build, real_rank = search.build_trades, search.rank_in_sample
+    real_pick, real_for = search.pick_finalists, search.trades_for
+
+    def build_spy(*a, **kw):
+        built.update(real_build(*a, **kw))
+        return built
+
+    def rank_spy(trades_by_cfg, risk_usd=config.RISK_USD):
+        items = list(trades_by_cfg.items() if hasattr(trades_by_cfg, "items") else trades_by_cfg)
+        for _, df in items:
+            assert (df["decision_time"] < SPLIT_TS).all()
+        calls.append(("rank", len(items)))
+        return real_rank(items, risk_usd)
+
+    def pick_spy(ranked):
+        assert "decision_time" not in ranked.columns and {"avg_r", "rank"} <= set(ranked.columns)
+        calls.append(("pick",))
+        return real_pick(ranked)
+
+    def for_spy(cfg, trades_by_spec, period):
+        calls.append(("for", period))
+        return real_for(cfg, trades_by_spec, period)
+
+    monkeypatch.setattr(search, "build_trades", build_spy)
+    monkeypatch.setattr(search, "rank_in_sample", rank_spy)
+    monkeypatch.setattr(search, "pick_finalists", pick_spy)
+    monkeypatch.setattr(search, "trades_for", for_spy)
+    # force stage 2 so the hours derivation and the filter variants also run through the spies
+    monkeypatch.setattr(search, "in_sample_gates", lambda cfg, tbs, risk_usd=config.RISK_USD:
+                        {"win_rate": False, "max_dd": True, "challenge": False, "bootstrap": False})
+    out = search.search(SYN_COINS, grid_detector=TINY_DET, grid_trade=TINY_SPECS)
+    assert any((df["decision_time"] >= SPLIT_TS).any() for df in built.values())  # OOS rows exist
+    ranks = [c for c in calls if c[0] == "rank"]
+    assert len(ranks) == 2 and ranks[1][1] > 0                # stage 2 ranked filter variants
+    last_pick = max(i for i, c in enumerate(calls) if c[0] == "pick")
+    outs = [i for i, c in enumerate(calls) if c == ("for", "out")]
+    assert outs and min(outs) > last_pick
+    assert all(c[1] == "in" for c in calls[:last_pick] if c[0] == "for")
+    assert out.exists()
+
+
+def test_end_to_end_on_synthetic_two_coins(synthetic, capsys):
+    out = search.search(SYN_COINS, grid_detector=TINY_DET, grid_trade=TINY_SPECS)
+    assert out.parent == synthetic / "reports"
+    names = {p.name for p in out.iterdir()}
+    assert {"in_sample_ranking.csv", "finalists.json", "oos_summary.json"} <= names
+    fin = json.loads((out / "finalists.json").read_text())
+    assert 1 <= len(fin) <= config.MAX_FINALISTS
+    assert {f"oos_trades_{k}.csv" for k in range(1, len(fin) + 1)} <= names
+    ranking = pd.read_csv(out / "in_sample_ranking.csv")
+    assert {"lookback", "stop_method", "entry", "n", "avg_r", "rank", "stage"} <= set(ranking.columns)
+    summ = json.loads((out / "oos_summary.json").read_text())
+    assert len(summ) == len(fin)
+    for f in summ:
+        assert set(f["by_risk"]) == {str(config.RISK_USD), str(config.RISK_USD_ALT)}
+        res = f["by_risk"][str(config.RISK_USD)]
+        assert {"summary", "bootstrap", "robustness", "verdict", "breakdown"} <= set(res)
+        assert set(res["breakdown"]) == {"symbol", "tf", "side", "year"}
+    oos = pd.read_csv(out / "oos_trades_1.csv", parse_dates=["decision_time"])
+    assert len(oos) and (oos["decision_time"] >= SPLIT_TS).all()
+    assert "elapsed" in capsys.readouterr().out
+
+
+def test_run_cli_dispatch(monkeypatch, capsys):
+    from models.ggshot_v2 import run
+    seen = []
+    monkeypatch.setattr(run.data, "download", lambda syms, start: seen.append(("dl", syms, start)))
+    monkeypatch.setattr(run.search, "search", lambda: seen.append(("search",)))
+    run.main(["download"])
+    run.main(["search"])
+    run.main(["sanity"])
+    assert seen == [("dl", config.COINS, config.START), ("search",)]
+    assert "Task 8" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        run.main([])

@@ -1,5 +1,6 @@
 """Portfolio selection (slot / one-per-coin limits) and challenge pass/fail evaluation."""
 
+import numpy as np
 import pandas as pd
 
 from .config import ACCOUNT, COINS, FLOOR, MAX_OPEN, PASS_LEVEL, TIMEFRAMES
@@ -16,20 +17,21 @@ def select_trades(trades: pd.DataFrame, max_open: int = MAX_OPEN) -> pd.DataFram
     """
     tf_rank = {tf: i for i, tf in enumerate(TIMEFRAMES)}
     coin_rank = {c: i for i, c in enumerate(COINS)}
-    order = sorted(
-        range(len(trades)),
-        key=lambda i: (trades["entry_time"].iloc[i],
-                       tf_rank.get(trades["tf"].iloc[i], len(tf_rank)),
-                       coin_rank.get(trades["symbol"].iloc[i], len(coin_rank)), i))
-    open_trades = []  # (exit_time, symbol) of accepted trades
+    entry_ns = pd.DatetimeIndex(trades["entry_time"]).asi8
+    exit_ns = pd.DatetimeIndex(trades["exit_time"]).asi8
+    symbols = trades["symbol"].astype(object).to_numpy()
+    tf_key = np.array([tf_rank.get(t, len(tf_rank)) for t in trades["tf"]], dtype=np.int64)
+    coin_key = np.array([coin_rank.get(s, len(coin_rank)) for s in symbols], dtype=np.int64)
+    order = np.lexsort((np.arange(len(trades)), coin_key, tf_key, entry_ns))
+    entry_l, exit_l, sym_l = entry_ns.tolist(), exit_ns.tolist(), symbols.tolist()
+    open_trades = []  # (exit_ns, symbol) of accepted trades
     accepted = []
-    for i in order:
-        entry = trades["entry_time"].iloc[i]
-        symbol = trades["symbol"].iloc[i]
+    for i in order.tolist():
+        entry, symbol = entry_l[i], sym_l[i]
         open_trades = [o for o in open_trades if o[0] > entry]
         if len(open_trades) < max_open and all(o[1] != symbol for o in open_trades):
             accepted.append(i)
-            open_trades.append((trades["exit_time"].iloc[i], symbol))
+            open_trades.append((exit_l[i], symbol))
     return trades.iloc[accepted].copy()
 
 
