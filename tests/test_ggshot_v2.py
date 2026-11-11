@@ -194,3 +194,86 @@ def test_indicators_are_causal():
     df = _random_bars(300, seed=1)
     for f in (lambda x: ind.atr(x), lambda x: ind.rsi(x.close), lambda x: ind.supertrend(x)[0]):
         assert f(df.iloc[:200]).iloc[-1] == pytest.approx(f(df).iloc[199])
+
+
+# ---------------------------------------------------------------- detector
+from models.ggshot_v2 import detector as det  # noqa: E402
+
+
+def _uptrend_with_breakout(n=200):
+    """Noisy uptrend; the last bar is a volume-spike close at a fresh high."""
+    rng = np.random.default_rng(5)
+    close = 100 + 0.5 * np.arange(n) + rng.normal(0, 0.8, n)
+    close[-1] = close[:-1].max() + 3.0
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    vol = np.ones(n)
+    vol[-1] = 5.0
+    return pd.DataFrame({"open": open_, "high": np.maximum(open_, close) + 0.3,
+                         "low": np.minimum(open_, close) - 0.3, "close": close,
+                         "volume": vol}, index=idx)
+
+
+def _mirror(df):
+    m = df.copy()
+    m["open"], m["close"] = 400 - df.open, 400 - df.close
+    m["high"], m["low"] = 400 - df.low, 400 - df.high
+    return m
+
+
+def test_scan_long_breakout_detected_and_mirror_short():
+    bars = _uptrend_with_breakout()
+    s = det.scan(bars, None)
+    last = s[s.signal_time == bars.index[-1]]
+    assert len(last) == 1 and last.side.iloc[0] == 1 and bool(last.ext30.iloc[0])
+    assert last.decision_time.iloc[0] == bars.index[-1] + pd.Timedelta(hours=1)
+    s_short = det.scan(_mirror(bars), None)
+    assert s_short[s_short.signal_time == bars.index[-1]].side.iloc[0] == -1
+    assert (s.signal_time >= bars.index[100]).all()
+
+
+def test_apply_params_is_a_subset_and_monotone():
+    s = det.scan(_random_bars(3000, seed=2), None)
+    loose = det.apply_params(s, det.DetectorParams(15, 55, 1.0))
+    tight = det.apply_params(s, det.DetectorParams(30, 70, 2.0))
+    assert set(tight.index) <= set(loose.index) and len(tight) < len(loose)
+    hrs = det.apply_params(s, det.DetectorParams(15, 55, 1.0, hours=(0, 1, 2)))
+    assert set(hrs.index) <= set(loose.index) and hrs.hour.isin([0, 1, 2]).all()
+
+
+def test_scan_is_decidable_at_decision_time():
+    bars = _random_bars(2000, seed=3)
+    s = det.scan(bars, None)
+    cols = ["side", "close", "rsi", "vol_ratio", "swing_low", "st_line", "atr_pct"]
+    for _, row in s.sample(5, random_state=0).iterrows():
+        cut = det.scan(bars[bars.index <= row.signal_time], None)
+        assert cut.iloc[-1][cols].equals(row[cols])
+
+
+def test_htf_filter_uses_only_closed_4h_bars():
+    bars = _uptrend_with_breakout()
+    t = bars.index[-1] + pd.Timedelta(hours=1)               # decision time of the breakout bar
+    idx4 = pd.date_range(t - pd.Timedelta(hours=4 * 80), t - pd.Timedelta(hours=4), freq="4h")
+    c4 = 100 + np.arange(len(idx4), dtype=float)             # rising: EMA20 > EMA50
+
+    def frame(closes, index):
+        return pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
+                             "volume": 1.0}, index=index)
+
+    def htf_at_last(h4):
+        s = det.scan(bars, h4)
+        return bool(s[s.signal_time == bars.index[-1]].htf_ok.iloc[0])
+
+    h4 = frame(c4, idx4)
+    assert h4.index[-1] + pd.Timedelta(hours=4) == t         # last bar closes exactly at t
+    assert htf_at_last(h4)
+    # a 4h bar opened at t-1h closes after t: its crash must not change htf_ok
+    late = frame(np.array([1.0]), [t - pd.Timedelta(hours=1)])
+    assert htf_at_last(pd.concat([h4, late]))
+    # the same crash on a bar that has closed by t does flip it
+    crash = c4.copy()
+    crash[-30:] = 1.0
+    assert not htf_at_last(frame(crash, idx4))
+    # no 4h data, or none closed yet, gives False
+    assert not det.scan(bars, None).htf_ok.any()
+    assert not htf_at_last(frame(np.array([100.0]), [t - pd.Timedelta(hours=1)]))
