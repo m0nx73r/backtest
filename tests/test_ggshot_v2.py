@@ -7,12 +7,13 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from models.ggshot_v2 import config, data  # noqa: E402
+from models.ggshot_v2 import config, data, indicators as ind  # noqa: E402
 
 HEADER = ("open_time,open,high,low,close,volume,close_time,quote_volume,count,"
           "taker_buy_volume,taker_buy_quote_volume,ignore")
@@ -146,3 +147,50 @@ def test_errored_tail_fetch_keeps_existing_tail(monkeypatch, tmp_path):
     assert (raw / "tail_1m.csv").read_text() == "GOOD-KLINES\n"
     assert (raw / "tail_funding.csv").read_text() == "GOOD-FUNDING\n"
     assert not list(raw.glob("*.part"))
+
+
+def _bars(high=11.0, low=9.0, close=10.0, n=50):
+    """Constant-range hourly OHLCV frame."""
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame({"open": close, "high": high, "low": low, "close": close,
+                         "volume": 1.0}, index=idx)
+
+
+def _trend_then_crash():
+    """60 rising bars then 20 falling bars, each with a +/-0.5 high-low range."""
+    closes = np.concatenate([100 + np.arange(60, dtype=float),
+                             159 - 3.0 * np.arange(1, 21)])
+    idx = pd.date_range("2024-01-01", periods=len(closes), freq="1h", tz="UTC")
+    return pd.DataFrame({"open": closes, "high": closes + 0.5, "low": closes - 0.5,
+                         "close": closes, "volume": 1.0}, index=idx)
+
+
+def _random_bars(n, seed=0):
+    rng = np.random.default_rng(seed)
+    close = 100 + np.cumsum(rng.normal(0, 1.0, n))
+    open_ = np.concatenate([[close[0]], close[:-1]]) + rng.normal(0, 0.2, n)
+    high = np.maximum(open_, close) + rng.random(n) * 0.8
+    low = np.minimum(open_, close) - rng.random(n) * 0.8
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
+                         "volume": rng.random(n) * 10 + 1}, index=idx)
+
+
+def test_rsi_extremes_and_atr_constant_range():
+    up = pd.Series(np.arange(1, 101, dtype=float))
+    assert ind.rsi(up).iloc[-1] == pytest.approx(100.0)
+    df = _bars(high=11.0, low=9.0, close=10.0, n=50)          # constant 2.0 range
+    assert ind.atr(df, 14).iloc[-1] == pytest.approx(2.0)
+
+
+def test_supertrend_flips_on_reversal():
+    df = _trend_then_crash()                                   # 60 rising bars then 20 falling
+    line, d = ind.supertrend(df, 14, 3.0)
+    assert d.iloc[59] == 1 and d.iloc[-1] == -1
+    assert (line.iloc[:60][d.iloc[:60] == 1] < df.close.iloc[:60][d.iloc[:60] == 1]).all()
+
+
+def test_indicators_are_causal():
+    df = _random_bars(300, seed=1)
+    for f in (lambda x: ind.atr(x), lambda x: ind.rsi(x.close), lambda x: ind.supertrend(x)[0]):
+        assert f(df.iloc[:200]).iloc[-1] == pytest.approx(f(df).iloc[199])
