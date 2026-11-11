@@ -15,6 +15,18 @@ from core.config import DAYS_BACK, ALIGNMENTS, ACTIVE_CHAIN
 ARTIFACT_DIR = os.path.join(PROJECT_ROOT, "exports", "failed_trades")
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
+RANGE_BARS = 40  # bars used for the HTF and bias dealing ranges
+
+
+def _range_line(label, low, high, mid, entry_px):
+    """Format a range readout; report n/a instead of a misleading label when the range is undefined."""
+    if np.isnan(mid):
+        return f"  {label}: n/a (not enough history) | Entry close is at {entry_px:.2f}"
+    zone = "Premium" if entry_px > mid else "Discount"
+    return (f"  {label}: Low={low:.2f}, High={high:.2f}, Mid={mid:.2f} | "
+            f"Entry close is at {entry_px:.2f} ({zone})")
+
+
 def generate_failed_trade_plots():
     symbol = "BTC/USDT"
     chain = "intraday"
@@ -42,26 +54,18 @@ def generate_failed_trade_plots():
     failed_trades = [t for t in trades if t["result"] == "LOSS"]
     print(f"Total trades: {len(trades)}, Failed trades: {len(failed_trades)}")
     
-    # Let's inspect a few failed trades
-    # We will pick 3 representative failed trades:
-    # 1. A Long that failed in April 2025
-    # 2. A Short that failed in June/July 2025
-    # 3. A Long/Short that failed in Sept/Oct 2025
-    
-    selected_trades = []
-    for t in failed_trades:
-        entry_time = pd.to_datetime(t["Entry Time"])
-        if entry_time.year == 2025:
-            if entry_time.month == 4 and len(selected_trades) == 0:
-                selected_trades.append(t)
-            elif entry_time.month == 6 and len(selected_trades) == 1:
-                selected_trades.append(t)
-            elif entry_time.month == 9 and len(selected_trades) == 2:
-                selected_trades.append(t)
-                
-    if len(selected_trades) < 3:
-        # Fallback to first 3 failed trades
-        selected_trades = failed_trades[:3]
+    # Pick 3 representative losses spread across the data window (early / middle / late),
+    # skipping trades that occur before the HTF range has RANGE_BARS bars of history.
+    eligible = [
+        t for t in failed_trades
+        if (df_htf.index <= pd.to_datetime(t["Entry Time"], utc=True)).sum() >= RANGE_BARS
+    ]
+    print(f"Losses with >= {RANGE_BARS} {tf_context} bars of history: {len(eligible)}")
+    if len(eligible) >= 3:
+        picks = [0, len(eligible) // 2, len(eligible) - 1]
+        selected_trades = [eligible[i] for i in picks]
+    else:
+        selected_trades = (eligible or failed_trades)[:3]
         
     for idx, t in enumerate(selected_trades):
         entry_time_str = t["Entry Time"]
@@ -78,8 +82,8 @@ def generate_failed_trade_plots():
         # 1. Calculate HTF (Daily) range at entry_time
         htf_slice = df_htf[df_htf.index <= entry_time]
         htf_high, htf_low, htf_mid = np.nan, np.nan, np.nan
-        if len(htf_slice) >= 40:
-            recent_htf = htf_slice.tail(40)
+        if len(htf_slice) >= RANGE_BARS:
+            recent_htf = htf_slice.tail(RANGE_BARS)
             htf_high = recent_htf['high'].max()
             htf_low = recent_htf['low'].min()
             htf_mid = (htf_high + htf_low) / 2
@@ -97,15 +101,15 @@ def generate_failed_trade_plots():
         # 3. Calculate Bias (1h) range at entry_time
         bias_slice = df_bias[df_bias.index <= entry_time]
         bias_high, bias_low, bias_mid = np.nan, np.nan, np.nan
-        if len(bias_slice) >= 40:
-            recent_bias = bias_slice.tail(40)
+        if len(bias_slice) >= RANGE_BARS:
+            recent_bias = bias_slice.tail(RANGE_BARS)
             bias_high = recent_bias['high'].max()
             bias_low = recent_bias['low'].min()
             bias_mid = (bias_high + bias_low) / 2
             
-        print(f"  HTF (1d) Range (40d): Low={htf_low:.2f}, High={htf_high:.2f}, Mid={htf_mid:.2f} | Entry close is at {entry_px:.2f} ({'Premium' if entry_px > htf_mid else 'Discount'})")
-        print(f"  Bias (1h) Range (40h): Low={bias_low:.2f}, High={bias_high:.2f}, Mid={bias_mid:.2f} | Entry close is at {entry_px:.2f} ({'Premium' if entry_px > bias_mid else 'Discount'})")
-        print(f"  LTF (5m) Range (200b): Low={ltf_low_val:.2f}, High={ltf_high_val:.2f}, Mid={ltf_mid:.2f} | Entry close is at {entry_px:.2f} ({'Premium' if entry_px > ltf_mid else 'Discount'})")
+        print(_range_line(f"HTF ({tf_context}) Range ({RANGE_BARS} bars)", htf_low, htf_high, htf_mid, entry_px))
+        print(_range_line(f"Bias ({tf_bias}) Range ({RANGE_BARS} bars)", bias_low, bias_high, bias_mid, entry_px))
+        print(_range_line(f"LTF ({tf_entry}) Range ({lookback} bars)", ltf_low_val, ltf_high_val, ltf_mid, entry_px))
         
         # Plotting the trade surroundings on LTF (5m) and Bias (1h) timeframes
         # Find exit index
