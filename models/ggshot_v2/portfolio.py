@@ -11,8 +11,11 @@ EVENT_COLUMNS = ["time", "kind", "closed_equity", "open_risk_usd", "open_notiona
 def select_trades(trades: pd.DataFrame, max_open: int = MAX_OPEN) -> pd.DataFrame:
     """Greedy accept in (entry_time, timeframe rank, coin rank) order.
 
-    A trade is open at t when entry_time <= t < exit_time. A candidate is accepted when fewer than
-    ``max_open`` accepted trades are open at its entry_time and none of them is on the same symbol.
+    A trade is open at t when entry_time <= t <= exit_time: exit_time is the minute in which the
+    stop/target was hit, and an entry in that minute fills at its open, i.e. before the exit, so an
+    exit in minute m frees the slot (and the coin) only for entries after m. A candidate is accepted
+    when fewer than ``max_open`` accepted trades are open at its entry_time and none of them is on
+    the same symbol.
     Returns the accepted rows (original index kept) in processing order; the input is not mutated.
     """
     tf_rank = {tf: i for i, tf in enumerate(TIMEFRAMES)}
@@ -28,7 +31,7 @@ def select_trades(trades: pd.DataFrame, max_open: int = MAX_OPEN) -> pd.DataFram
     accepted = []
     for i in order.tolist():
         entry, symbol = entry_l[i], sym_l[i]
-        open_trades = [o for o in open_trades if o[0] > entry]
+        open_trades = [o for o in open_trades if o[0] >= entry]   # exit in this minute: still open
         if len(open_trades) < max_open and all(o[1] != symbol for o in open_trades):
             accepted.append(i)
             open_trades.append((exit_l[i], symbol))
@@ -38,13 +41,14 @@ def select_trades(trades: pd.DataFrame, max_open: int = MAX_OPEN) -> pd.DataFram
 def equity_curve(selected: pd.DataFrame, risk_usd: float, start: float = ACCOUNT) -> pd.DataFrame:
     """Event table (entries and exits) with closed equity and open risk/notional after each event.
 
-    Exits are processed before entries at equal timestamps.
+    Entries are processed before exits at equal timestamps (an entry fills at the minute's open,
+    before a stop/target hit in that minute), so open risk includes both at that minute.
     """
     events = []  # (time, kind_rank, seq, kind, pnl, risk, notional)
     for seq, row in enumerate(selected.itertuples(index=False)):
         notional = row.notional_per_risk * risk_usd
-        events.append((row.entry_time, 1, seq, "entry", 0.0, risk_usd, notional))
-        events.append((row.exit_time, 0, seq, "exit", row.r_net * risk_usd, -risk_usd, -notional))
+        events.append((row.entry_time, 0, seq, "entry", 0.0, risk_usd, notional))
+        events.append((row.exit_time, 1, seq, "exit", row.r_net * risk_usd, -risk_usd, -notional))
     events.sort(key=lambda e: e[:3])
     out = []
     equity, open_risk, open_notional = start, 0.0, 0.0

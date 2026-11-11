@@ -20,9 +20,13 @@ STORE_VERSION = 1
 
 
 def spec_key(spec):
-    """Short, stable, filesystem-safe, unique-per-spec file stem."""
-    return (f"{spec.stop_method}-{spec.stop_k!r}_t{spec.target_r!r}_{spec.entry}_"
-            f"{spec.confirm_minutes}_{spec.confirm_atr!r}")
+    """Short, stable, filesystem-safe, unique-per-spec file stem.
+
+    Numeric fields are normalised (float / int) so equal specs, e.g. TradeSpec("atr", 2, 2) and
+    TradeSpec("atr", 2.0, 2.0), map to the same file.
+    """
+    return (f"{spec.stop_method}-{float(spec.stop_k)!r}_t{float(spec.target_r)!r}_{spec.entry}_"
+            f"{int(spec.confirm_minutes)}_{float(spec.confirm_atr)!r}")
 
 
 def empty_frame(columns):

@@ -531,16 +531,23 @@ def test_1h_beats_30m_on_same_close():
     assert len(sel) == 1 and sel.iloc[0].symbol == "ETHUSDT" and sel.iloc[0].tf == "1h"
 
 
-def test_slot_frees_at_exit_time():
+def test_slot_frees_only_after_exit_minute():
+    # exit_time is the minute in which the stop/target was hit; a next-open entry in that minute
+    # fills at its open, i.e. before the exit, so the slot is still taken during the exit minute.
     rows = [_t("BTCUSDT", "1h", 0, 60), _t("ETHUSDT", "1h", 59, 100), _t("SOLUSDT", "1h", 60, 120),
-            _t("BTCUSDT", "1h", 60, 90)]
+            _t("BTCUSDT", "1h", 60, 90), _t("AVAXUSDT", "1h", 61, 130), _t("ADAUSDT", "1h", 61, 130)]
     sel = portfolio.select_trades(_frame(rows), max_open=1)
-    # ETH at 59 is blocked (BTC open); at 60 BTC has exited, so the slot is free: BTC (coin rank) wins
+    # ETH at 59 and SOL/BTC at 60 are blocked (BTC still open in its exit minute); at 61 the slot
+    # is free and ADA wins on coin rank
     assert [(r.symbol, r.entry_time) for r in sel.itertuples()] == [
-        ("BTCUSDT", P0), ("BTCUSDT", P0 + pd.Timedelta(minutes=60))]
-    # same coin may re-enter exactly at its own exit time
-    rows2 = [_t("BTCUSDT", "1h", 0, 60), _t("BTCUSDT", "1h", 60, 120)]
-    assert len(portfolio.select_trades(_frame(rows2))) == 2
+        ("BTCUSDT", P0), ("ADAUSDT", P0 + pd.Timedelta(minutes=61))]
+    # same coin may not re-enter in its own exit minute, only after it
+    rows2 = [_t("BTCUSDT", "1h", 0, 60), _t("BTCUSDT", "1h", 60, 120), _t("BTCUSDT", "1h", 61, 120)]
+    sel2 = portfolio.select_trades(_frame(rows2))
+    assert list(sel2.entry_time) == [P0, P0 + pd.Timedelta(minutes=61)]
+    # a trade that enters and exits in the same minute still occupies that minute
+    rows3 = [_t("BTCUSDT", "1h", 30, 30), _t("ETHUSDT", "1h", 30, 90), _t("SOLUSDT", "1h", 31, 90)]
+    assert list(portfolio.select_trades(_frame(rows3), max_open=1).symbol) == ["BTCUSDT", "SOLUSDT"]
 
 
 def test_select_keeps_index_and_does_not_mutate_input():
@@ -552,14 +559,32 @@ def test_select_keeps_index_and_does_not_mutate_input():
     pd.testing.assert_frame_equal(df, before)
 
 
-def test_equity_curve_events_and_exit_before_entry():
+def test_equity_curve_events_and_entry_before_exit():
     rows = [_t("BTCUSDT", "1h", 0, 60, r_net=2.0, npr=50.0), _t("ETHUSDT", "1h", 60, 120, r_net=-1.0, npr=40.0)]
     ec = portfolio.equity_curve(_frame(rows), risk_usd=20.0)
     assert list(ec.columns) == ["time", "kind", "closed_equity", "open_risk_usd", "open_notional_usd"]
-    assert list(ec.kind) == ["entry", "exit", "entry", "exit"]  # exit@60 precedes entry@60
-    assert list(ec.closed_equity) == pytest.approx([5000.0, 5040.0, 5040.0, 5020.0])
-    assert list(ec.open_risk_usd) == pytest.approx([20.0, 0.0, 20.0, 0.0])
-    assert list(ec.open_notional_usd) == pytest.approx([1000.0, 0.0, 800.0, 0.0])
+    assert list(ec.kind) == ["entry", "entry", "exit", "exit"]  # entry@60 precedes exit@60
+    assert list(ec.closed_equity) == pytest.approx([5000.0, 5000.0, 5040.0, 5020.0])
+    assert list(ec.open_risk_usd) == pytest.approx([20.0, 40.0, 20.0, 0.0])
+    assert list(ec.open_notional_usd) == pytest.approx([1000.0, 1800.0, 800.0, 0.0])
+
+
+def test_equity_curve_same_minute_trade_enters_before_it_exits():
+    # stop hit in the entry minute: the trade's own entry must precede its exit (open risk never < 0)
+    rows = [_t("BTCUSDT", "1h", 30, 30, r_net=-1.0), _t("ETHUSDT", "1h", 30, 90, r_net=1.0)]
+    ec = portfolio.equity_curve(_frame(rows), risk_usd=20.0)
+    assert list(ec.kind) == ["entry", "entry", "exit", "exit"]
+    assert list(ec.open_risk_usd) == pytest.approx([20.0, 40.0, 20.0, 0.0])
+    assert (ec.open_risk_usd >= 0).all()
+
+
+def test_challenge_fail_counts_entry_in_same_minute_as_exit():
+    # closed 4,740 with one $20 trade open; a second trade enters in the minute the first exits:
+    # 4740 - 40 = 4700 <= FLOOR must fail at that minute (entries are processed before exits)
+    rows = [_t("BTCUSDT", "1h", 0, 10, r_net=-13.0),
+            _t("ETHUSDT", "1h", 20, 60, r_net=1.0), _t("SOLUSDT", "1h", 60, 120, r_net=1.0)]
+    out = portfolio.challenge_outcome(_frame(rows), risk_usd=20.0)
+    assert out == {"passed": False, "time": P0 + pd.Timedelta(minutes=60), "trades_taken": 3}
 
 
 def test_challenge_fail_uses_open_risk():
@@ -702,7 +727,7 @@ def _reference_select(trades, max_open=config.MAX_OPEN):
     open_trades, accepted = [], []
     for i in order:
         entry, symbol = trades["entry_time"].iloc[i], trades["symbol"].iloc[i]
-        open_trades = [o for o in open_trades if o[0] > entry]
+        open_trades = [o for o in open_trades if o[0] >= entry]
         if len(open_trades) < max_open and all(o[1] != symbol for o in open_trades):
             accepted.append(i)
             open_trades.append((trades["exit_time"].iloc[i], symbol))
@@ -1010,9 +1035,12 @@ def test_store_parallel_build_equals_serial(synthetic, tmp_path):
     for s in TINY_SPECS:
         assert len(par[s]) > 0
         pd.testing.assert_frame_equal(_sorted(ser[s]), _sorted(par[s]))
+    # all cached: nothing is resolved again, but the workers still load the (synthetic) data to
+    # fingerprint it, so the loaders must be passed or they would read real data
     again = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "p", workers=2,
-                                loaders=None)   # all cached: loaders unused
-    assert len(again[TINY_SPECS[0]]) == len(par[TINY_SPECS[0]])
+                                loaders=loaders)
+    for s in TINY_SPECS:
+        pd.testing.assert_frame_equal(_sorted(again[s]), _sorted(par[s]))
 
 
 def _count_resolves(monkeypatch):
@@ -1052,3 +1080,28 @@ def test_store_version_bump_rebuilds(synthetic, tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "STORE_VERSION", store_mod.STORE_VERSION + 1)
     search.build_trades(SYN_COINS[:1], specs=TINY_SPECS, store_dir=sd)
     assert len(calls) == len(TINY_SPECS) * 2
+
+
+def test_spec_key_ignores_int_vs_float_and_matches_cached_names():
+    from models.ggshot_v2.trades import TradeSpec
+    assert TradeSpec("atr", 2, 2) == TradeSpec("atr", 2.0, 2.0)
+    assert store_mod.spec_key(TradeSpec("atr", 2, 2)) == store_mod.spec_key(TradeSpec("atr", 2.0, 2.0))
+    # existing cache file stems (built from GRID_TRADE) must not change
+    assert store_mod.spec_key(TradeSpec("atr", 4.0, 3.0)) == "atr-4.0_t3.0_next_open_0_0.0"
+    assert (store_mod.spec_key(TradeSpec("atr", 4, 3, "confirm", 30, 0.25))
+            == "atr-4.0_t3.0_confirm_30_0.25")
+    assert store_mod.spec_key(TradeSpec("swing", 0, 3)) == "swing-0.0_t3.0_next_open_0_0.0"
+    assert len({store_mod.spec_key(s) for s in search.GRID_TRADE}) == len(search.GRID_TRADE)
+
+
+def test_store_lookup_with_int_spec_finds_float_built_trades(synthetic, tmp_path):
+    from models.ggshot_v2.trades import TradeSpec
+    spec_f = TINY_SPECS[0]
+    st = search.build_trades(SYN_COINS[:1], specs=[spec_f], store_dir=tmp_path / "st")
+    spec_i = TradeSpec(spec_f.stop_method, int(spec_f.stop_k), int(spec_f.target_r), spec_f.entry,
+                       spec_f.confirm_minutes, spec_f.confirm_atr)
+    assert spec_i == spec_f
+    got = st[spec_i]                     # looked up first, so the one-spec read cache cannot mask it
+    assert len(got) > 0
+    fresh = search.build_trades(SYN_COINS[:1], specs=[spec_f], store_dir=tmp_path / "st")
+    pd.testing.assert_frame_equal(got, fresh[spec_f])

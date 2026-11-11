@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from models.ggshot_v2 import data
-from models.ggshot_v2.detector import DetectorParams, apply_params, scan
+from models.ggshot_v2.detector import COLUMNS, DetectorParams, apply_params, scan
 from models.ggshot_v2.trades import TradeSpec, resolve_trades
 
 CACHE = os.path.join(data.DATA_DIR, "cache", "BTCUSDT_1m.npz")
@@ -32,5 +32,9 @@ def test_trades_are_decidable_at_decision_time():
         last = cut_sc.iloc[-1]
         assert last.signal_time == sig.signal_time
         assert last.side == sig.side
-        for col in ("close", "atr", "st_line"):
-            assert last[col] == pytest.approx(sig[col])
+        for col in COLUMNS:                       # every detector column, as seen at decision time
+            a, b = last[col], sig[col]
+            if isinstance(b, (float, np.floating)):
+                assert a == pytest.approx(b, nan_ok=True), col
+            else:                                 # bools, ints, timestamps: exact
+                assert a == b, col
