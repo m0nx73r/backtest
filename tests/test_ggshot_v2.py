@@ -459,3 +459,33 @@ def test_missing_minutes_and_index_preserved():
     sigs["swing_high"] = [np.nan, np.nan, 101.0]
     out = trades.resolve_trades(sigs, _m1_path([100, 100.5, 104.5]), _no_funding(), sw, "X", "1h")
     assert list(out.index) == [10, 30]
+
+
+def _funding_trade(start, n_flat, last_close, mark):
+    m1 = _m1_path([100.0] * n_flat + [last_close], start)
+    fund = pd.Series([0.0001], index=pd.DatetimeIndex([mark], tz="UTC"))
+    return trades.resolve_trades(_sig(start=start), m1, fund, trades.TradeSpec("atr", 2.0, 2.0),
+                                 "X", "1h").iloc[0]
+
+
+def test_funding_minute_floor_entry_on_mark_not_charged():
+    # entry bar opens exactly on the 08:00 mark (stamped 08:00:00.006): position opens after settlement
+    t = _funding_trade(pd.Timestamp("2024-01-01 08:00", tz="UTC"), 30, 104.5, "2024-01-01 08:00:00.006")
+    assert t.entry_time == pd.Timestamp("2024-01-01 08:00", tz="UTC") and t.exit_reason == "TP"
+    assert t.r_funding == 0.0
+
+
+def test_funding_minute_floor_exit_inside_mark_minute_charged():
+    t = _funding_trade(pd.Timestamp("2024-01-01 07:30", tz="UTC"), 30, 104.5, "2024-01-01 08:00:00.006")
+    assert t.exit_time == pd.Timestamp("2024-01-01 08:00", tz="UTC") and t.exit_reason == "TP"
+    assert t.r_funding == pytest.approx(-0.0001 * t.entry_px / t.risk_px)
+
+
+def test_confirm_stop_on_entry_bar_fills_at_stop_not_prior_open():
+    spec = trades.TradeSpec("atr", 0.4, 2.0, entry="confirm", confirm_minutes=5, confirm_atr=0.5)
+    # L = 100.5, entry 100.5*1.0002, stop = entry - 0.4; bar opens 100 (< stop) before the trigger
+    bars = [(100, 100.6, 99.0, 100.3), (100.3, 100.3, 100.3, 100.3)]
+    t = trades.resolve_trades(_sig(), _m1_bars(bars), _no_funding(), spec, "X", "1h").iloc[0]
+    e = 100.5 * (1 + SLIP)
+    assert t.entry_px == pytest.approx(e) and t.exit_reason == "SL"
+    assert t.exit_px == pytest.approx((e - 0.4) * (1 - SLIP))

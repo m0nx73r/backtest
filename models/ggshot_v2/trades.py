@@ -14,6 +14,7 @@ from models.ggshot_v2.config import FEE_MAKER, FEE_TAKER, SLIPPAGE
 MAX_ENTRY_DELAY_NS = 5 * 60 * 10**9      # skip a signal whose first bar opens > 5 min late
 MIN_STOP_ATR = 1.0
 MAX_STOP_ATR = 6.0
+MINUTE_NS = 60 * 10**9
 FIRST_WINDOW = 43_200                    # minutes (30 days); doubled until resolved
 
 COLUMNS = ["symbol", "tf", "side", "signal_time", "decision_time", "entry_time", "entry_px",
@@ -46,7 +47,7 @@ def _first_le(cummin, x):
     return int(np.searchsorted(-cummin, -x, side="left"))
 
 
-def _find_exit(side, ei, stop, target, o, h, l, c):
+def _find_exit(side, ei, stop, target, o, h, l, c, no_gap_bar=-1):
     """Return (index, reason, raw_price) of the exit for a position entered in bar ei."""
     n = len(o)
     window = FIRST_WINDOW
@@ -62,7 +63,7 @@ def _find_exit(side, ei, stop, target, o, h, l, c):
         if si < size or ti < size:
             if si <= ti:                                   # stop wins ties
                 k = ei + si
-                gap = o[k] <= stop if side == 1 else o[k] >= stop
+                gap = k != no_gap_bar and (o[k] <= stop if side == 1 else o[k] >= stop)
                 return k, "SL", (o[k] if gap else stop)
             return ei + ti, "TP", target
         if end == n:
@@ -78,6 +79,7 @@ def resolve_trades(signals, m1, funding, spec, symbol, tf):
     o, h, l, c = (m1[k].to_numpy(float) for k in ("open", "high", "low", "close"))
     n = len(ts)
     f_ns = _ns(funding.index)
+    f_ns = (f_ns // MINUTE_NS) * MINUTE_NS       # funding jitter (ms) floored to the minute
     f_cum = np.concatenate([[0.0], np.cumsum(np.nan_to_num(funding.to_numpy(float)))])
 
     dec_ns = _ns(signals["decision_time"])
@@ -93,6 +95,7 @@ def resolve_trades(signals, m1, funding, spec, symbol, tf):
         if not atr > 0:
             continue
         i0 = int(np.searchsorted(ts, d, side="left"))
+        pre_entry_open = False        # confirm entry whose entry-bar open had not reached the trigger
         if spec.entry == "confirm":
             j1 = int(np.searchsorted(ts, d + spec.confirm_minutes * 60 * 10**9, side="left"))
             if j1 <= i0:
@@ -103,6 +106,7 @@ def resolve_trades(signals, m1, funding, spec, symbol, tf):
                 continue
             ei = i0 + int(hit.argmax())
             raw = max(trig, o[ei]) if side == 1 else min(trig, o[ei])
+            pre_entry_open = raw == trig and o[ei] != trig
         else:
             if i0 >= n or ts[i0] - d > MAX_ENTRY_DELAY_NS:
                 continue
@@ -122,7 +126,8 @@ def resolve_trades(signals, m1, funding, spec, symbol, tf):
         risk = abs(entry - stop)
         target = entry + side * spec.target_r * risk
 
-        k, reason, raw_exit = _find_exit(side, ei, stop, target, o, h, l, c)
+        k, reason, raw_exit = _find_exit(side, ei, stop, target, o, h, l, c,
+                                         ei if pre_entry_open else -1)
         if reason == "TP":
             exit_px, exit_fee = raw_exit, FEE_MAKER
         else:
