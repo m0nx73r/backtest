@@ -21,6 +21,7 @@ SLIPPAGE = 0.0002
 
 DATA_DIR = "data/futures"
 REPORT_DIR = "reports/ggshot_v2"
+TRADE_CACHE_DIR = "data/futures/trades_cache/v1"   # resumable resolved-trade store (data/futures is gitignored)
 
 MIN_IS_TRADES = 150
 MIN_OOS_TRADES = 100

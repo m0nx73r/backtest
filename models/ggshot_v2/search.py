@@ -7,7 +7,9 @@ after the finalists are fixed, by ``run_out_of_sample``.
 
 import json
 import os
+import shutil
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,8 +17,10 @@ from pathlib import Path
 import pandas as pd
 
 from . import data, metrics
+from . import store as store_mod
 from .config import (BOOTSTRAP_RUNS, COINS, MAX_FINALISTS, MIN_IS_TRADES, REPORT_DIR, RISK_USD,
-                     RISK_USD_ALT, SPLIT, TIMEFRAMES)
+                     RISK_USD_ALT, SPLIT, TIMEFRAMES, TRADE_CACHE_DIR)
+from .store import TradeStore
 from .detector import DetectorParams, apply_params, scan
 from .portfolio import select_trades
 from .trades import COLUMNS as TRADE_COLUMNS, TradeSpec, resolve_trades
@@ -57,32 +61,79 @@ def _in_period(df, period):
 
 # --------------------------------------------------------------------------- trades
 
-def build_trades(symbols, period=None, specs=GRID_TRADE, timeframes=TIMEFRAMES):
-    """Resolved trades of the scan superset, per TradeSpec, across all symbols and timeframes.
+def _build_coin(sym, specs, timeframes, store_dir, period, loaders, label=""):
+    """Scan + resolve + write every not-yet-done (coin, tf) of one symbol; returns small status.
 
-    One coin's 1m data is held at a time. Each (coin, tf) is scanned once over the full history
-    and resolved once per spec; the scan's filter features are joined on so ``apply_params`` can
-    narrow the rows per detector config. ``period`` ("in"/"out"/None) keeps rows by decision_time.
+    Top-level so a spawned worker process can import it. Only this coin's 1m data is in memory.
     """
     t0 = time.time()
-    parts = {spec: [] for spec in specs}
-    for ci, sym in enumerate(symbols, 1):
-        m1, funding = data.load_1m(sym), data.load_funding(sym)
+    load_1m, load_funding = loaders or (data.load_1m, data.load_funding)
+    st = TradeStore(store_dir, specs, [(sym, tf) for tf in timeframes], TRADE_COLUMNS + FEATURES,
+                    period)
+    todo = [tf for tf in timeframes if not st.is_done(sym, tf)]
+    for tf in timeframes:
+        if tf not in todo:
+            _log(f"{label}{sym} {tf}: skip (cached)", t0)
+    signals = {}
+    if todo:
+        m1, funding = load_1m(sym), load_funding(sym)
         bars_4h = data.resample(m1, "4h")
-        for tf in timeframes:
+        for tf in todo:
+            st.begin(sym, tf)
             sc = scan(data.resample(m1, tf), bars_4h)
             for spec in specs:
-                tr = resolve_trades(sc, m1, funding, spec, sym, tf)
-                tr = _in_period(tr, period)
-                if len(tr):
-                    parts[spec].append(tr.join(sc[FEATURES]))
-            _log(f"coin {ci}/{len(symbols)} {sym} {tf}: {len(sc)} signals x {len(specs)} specs", t0)
+                tr = _in_period(resolve_trades(sc, m1, funding, spec, sym, tf), period)
+                st.write(sym, tf, spec, tr.join(sc[FEATURES]) if len(tr) else tr.iloc[:0])
+            st.finish(sym, tf)
+            signals[tf] = len(sc)
+            _log(f"{label}{sym} {tf}: {len(sc)} signals x {len(specs)} specs", t0)
         del m1, funding, bars_4h
-    out = {}
-    for spec, frames in parts.items():
-        out[spec] = (pd.concat(frames, ignore_index=True) if frames
-                     else pd.DataFrame(columns=TRADE_COLUMNS + FEATURES))
-    return out
+    return {"symbol": sym, "built": signals, "skipped": [tf for tf in timeframes if tf not in todo],
+            "seconds": round(time.time() - t0, 1)}
+
+
+def build_trades(symbols, period=None, specs=GRID_TRADE, timeframes=TIMEFRAMES, store_dir=None,
+                 workers=1, loaders=None):
+    """Resolved trades of the scan superset, per TradeSpec, across all symbols and timeframes.
+
+    One coin's 1m data is held at a time per process. Each (coin, tf) is scanned once over the
+    full history and resolved once per spec; the scan's filter features are joined on so
+    ``apply_params`` can narrow the rows per detector config. ``period`` ("in"/"out"/None) keeps
+    rows by decision_time.
+
+    Every (coin, tf, spec) frame is written to disk as soon as it is resolved, so nothing
+    accumulates in memory and an interrupted build resumes at the first incomplete (coin, tf).
+    ``store_dir=None`` uses a temporary directory that lives as long as the returned store.
+    ``workers`` > 1 builds one coin per worker process (workers write their own files and return
+    only status). ``loaders`` = (load_1m, load_funding), picklable top-level callables, overrides
+    the data loaders (used by tests). Returns a ``TradeStore`` (mapping TradeSpec -> DataFrame,
+    one spec cached at a time).
+    """
+    tmp = None
+    if store_dir is None:
+        tmp = store_mod.temp_root()
+        store_dir = tmp.name
+    specs, symbols, timeframes = list(specs), list(symbols), list(timeframes)
+    store = TradeStore(store_dir, specs, [(s, tf) for s in symbols for tf in timeframes],
+                       TRADE_COLUMNS + FEATURES, period)
+    store._tmp = tmp
+    args = (specs, timeframes, str(store_dir), period, loaders)
+    if workers > 1 and len(symbols) > 1:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_build_coin, sym, *args, f"[{i}/{len(symbols)}] "): sym
+                    for i, sym in enumerate(symbols, 1)}
+            failed = None
+            for fut in as_completed(futs):
+                try:
+                    fut.result()
+                except Exception as e:      # other coins keep running; their files stay valid
+                    failed = failed or (futs[fut], e)
+            if failed:
+                raise RuntimeError(f"build failed for {failed[0]}: {failed[1]!r}") from failed[1]
+    else:
+        for i, sym in enumerate(symbols, 1):
+            _build_coin(sym, *args, f"[{i}/{len(symbols)}] ")
+    return store
 
 
 def trades_for(cfg, trades_by_spec, period):
@@ -98,12 +149,13 @@ def _cfg_columns(cfg):
     return {**asdict(det), **asdict(spec)}
 
 
-def rank_in_sample(trades_by_cfg, risk_usd=RISK_USD):
+def rank_in_sample(trades_by_cfg, risk_usd=RISK_USD, order=None):
     """Per config (after ``select_trades``): n, win_rate, avg_r, pf, max_dd_pct, challenge.
 
     ``trades_by_cfg`` is a mapping or an iterable of (cfg, in-sample trades) pairs. Configs with
     n >= MIN_IS_TRADES are ranked by avg_r (``rank`` 1, 2, ...) and listed first; the rest follow
-    with rank NaN and are never eligible.
+    with rank NaN and are never eligible. ``order`` (a list of cfgs) restores a canonical row order
+    before ranking, so the stable sort's tie-breaks do not depend on the iteration order.
     """
     items = trades_by_cfg.items() if hasattr(trades_by_cfg, "items") else trades_by_cfg
     rows, t0 = [], time.time()
@@ -115,7 +167,10 @@ def rank_in_sample(trades_by_cfg, risk_usd=RISK_USD):
         if k % 250 == 0:
             _log(f"ranked {k} configs", t0)
     ranked = pd.DataFrame(rows, columns=None if rows else ["cfg", "n", "avg_r"])
-    return _rank(ranked)
+    if order is not None and len(ranked):
+        pos = {c: i for i, c in enumerate(order)}
+        ranked = ranked.iloc[sorted(range(len(ranked)), key=lambda i: pos[ranked["cfg"].iat[i]])]
+    return _rank(ranked.reset_index(drop=True))
 
 
 def _rank(ranked):
@@ -215,18 +270,27 @@ def run_out_of_sample(finalists, trades_by_spec, out_dir=None):
 
 # --------------------------------------------------------------------------- pipeline
 
-def search(symbols=COINS, grid_detector=GRID_DETECTOR, grid_trade=GRID_TRADE):
-    """Full pipeline; returns the report folder REPORT_DIR/<timestamp>/."""
+def search(symbols=COINS, grid_detector=GRID_DETECTOR, grid_trade=GRID_TRADE, fresh=False, workers=1):
+    """Full pipeline; returns the report folder REPORT_DIR/<timestamp>/.
+
+    Resolved trades are cached under TRADE_CACHE_DIR so a crashed run resumes; ``fresh`` deletes
+    that cache first.
+    """
     t0 = time.time()
     root = Path(REPORT_DIR) if os.path.isabs(REPORT_DIR) else _ROOT / REPORT_DIR
     out_dir = root / datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    trades_by_spec = build_trades(symbols, specs=grid_trade)
+    cache = Path(TRADE_CACHE_DIR) if os.path.isabs(TRADE_CACHE_DIR) else _ROOT / TRADE_CACHE_DIR
+    if fresh and cache.exists():
+        shutil.rmtree(cache)
+    trades_by_spec = build_trades(symbols, specs=grid_trade, store_dir=cache, workers=workers)
     _log(f"trades built for {len(grid_trade)} specs", t0)
 
-    cfgs = [(d, s) for d in grid_detector for s in grid_trade]
-    ranked = rank_in_sample(((c, trades_for(c, trades_by_spec, "in")) for c in cfgs))
+    cfgs = [(d, s) for d in grid_detector for s in grid_trade]       # canonical (tie-break) order
+    spec_major = ((d, s) for s in grid_trade for d in grid_detector)  # each spec loaded once
+    ranked = rank_in_sample(((c, trades_for(c, trades_by_spec, "in")) for c in spec_major),
+                            order=cfgs)
     ranked["stage"] = 1
     _log(f"stage 1 ranked {len(cfgs)} configs, {int(ranked['rank'].notna().sum())} eligible", t0)
     finalists = pick_finalists(ranked)

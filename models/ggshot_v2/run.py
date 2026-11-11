@@ -52,7 +52,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m models.ggshot_v2.run")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("download", help="fetch 1m klines + funding for all coins")
-    sub.add_parser("search", help="in-sample grid search, finalists, one out-of-sample run")
+    sp = sub.add_parser("search", help="in-sample grid search, finalists, one out-of-sample run")
+    sp.add_argument("--workers", type=int, default=4, help="coins built in parallel (processes)")
+    sp.add_argument("--fresh", action="store_true", help="delete the resolved-trade cache first")
     sub.add_parser("sanity", help="sanity checks on the downloaded data and the pipeline")
     args = parser.parse_args(argv)
 
@@ -60,7 +62,7 @@ def main(argv=None):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
         data.download(COINS, START)
     elif args.command == "search":
-        search.search()
+        search.search(fresh=args.fresh, workers=args.workers)
     elif args.command == "sanity":
         sanity()
 

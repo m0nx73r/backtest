@@ -730,6 +730,7 @@ def test_select_trades_matches_reference_on_random_frames():
 import json  # noqa: E402
 
 from models.ggshot_v2 import search  # noqa: E402
+from models.ggshot_v2 import store as store_mod  # noqa: E402
 
 SPLIT_TS = pd.Timestamp(config.SPLIT, tz="UTC")
 _SYN_CACHE = {}
@@ -770,6 +771,7 @@ def synthetic(monkeypatch, tmp_path):
     monkeypatch.setattr(search, "MIN_IS_TRADES", 5)
     monkeypatch.setattr(search, "BOOTSTRAP_RUNS", 200)
     monkeypatch.setattr(search, "REPORT_DIR", str(tmp_path / "reports"))
+    monkeypatch.setattr(search, "TRADE_CACHE_DIR", str(tmp_path / "trades_cache"))
     return tmp_path
 
 
@@ -853,12 +855,12 @@ def test_oos_never_feeds_selection(synthetic, monkeypatch):
         built.update(real_build(*a, **kw))
         return built
 
-    def rank_spy(trades_by_cfg, risk_usd=config.RISK_USD):
+    def rank_spy(trades_by_cfg, risk_usd=config.RISK_USD, **kw):
         items = list(trades_by_cfg.items() if hasattr(trades_by_cfg, "items") else trades_by_cfg)
         for _, df in items:
             assert (df["decision_time"] < SPLIT_TS).all()
         calls.append(("rank", len(items)))
-        return real_rank(items, risk_usd)
+        return real_rank(items, risk_usd, **kw)
 
     def pick_spy(ranked):
         assert "decision_time" not in ranked.columns and {"avg_r", "rank"} <= set(ranked.columns)
@@ -913,11 +915,101 @@ def test_run_cli_dispatch(monkeypatch, capsys):
     from models.ggshot_v2 import run
     seen = []
     monkeypatch.setattr(run.data, "download", lambda syms, start: seen.append(("dl", syms, start)))
-    monkeypatch.setattr(run.search, "search", lambda: seen.append(("search",)))
+    monkeypatch.setattr(run.search, "search", lambda **kw: seen.append(("search", kw)))
     run.main(["download"])
     run.main(["search"])
     monkeypatch.setattr(run, "sanity", lambda: seen.append(("sanity",)))
     run.main(["sanity"])
-    assert seen == [("dl", config.COINS, config.START), ("search",), ("sanity",)]
+    assert seen == [("dl", config.COINS, config.START), ("search", {"fresh": False, "workers": 4}),
+                    ("sanity",)]
     with pytest.raises(SystemExit):
         run.main([])
+
+
+# ------------------------------------------------------------------- disk-backed store (Task 7b)
+
+def _sorted(df):
+    return df.sort_values(["symbol", "tf", "decision_time"]).reset_index(drop=True)
+
+
+def test_store_matches_in_memory_build(synthetic, tmp_path):
+    mem = search.build_trades(SYN_COINS, specs=TINY_SPECS)
+    disk = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "st")
+    assert len(disk) == 2 and set(disk) == set(TINY_SPECS) and TINY_SPECS[0] in disk
+    for spec in TINY_SPECS:
+        a, b = _sorted(mem[spec]), _sorted(disk[spec])
+        assert disk[spec].index.is_unique and len(b) > 0
+        pd.testing.assert_frame_equal(a, b)
+    for sym in SYN_COINS:
+        for tf in config.TIMEFRAMES:
+            assert (tmp_path / "st" / f"{sym}_{tf}" / "_done").is_file()
+
+
+def test_store_resumes_only_missing_pair(synthetic, tmp_path, monkeypatch):
+    sd = tmp_path / "st"
+    first = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    ref = {s: _sorted(first[s]) for s in TINY_SPECS}
+    d = sd / f"{SYN_COINS[1]}_{config.TIMEFRAMES[0]}"
+    for f in d.iterdir():
+        f.unlink()
+    calls = []
+    real = search.resolve_trades
+
+    def spy(sc, m1, funding, spec, sym, tf):
+        calls.append((sym, tf, spec))
+        return real(sc, m1, funding, spec, sym, tf)
+
+    monkeypatch.setattr(search, "resolve_trades", spy)
+    again = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=sd)
+    assert {(c[0], c[1]) for c in calls} == {(SYN_COINS[1], config.TIMEFRAMES[0])}
+    assert len(calls) == len(TINY_SPECS)
+    for s in TINY_SPECS:
+        pd.testing.assert_frame_equal(ref[s], _sorted(again[s]))
+
+
+def test_store_empty_spec_has_datetime_columns(synthetic, tmp_path):
+    never = trades.TradeSpec("atr", 2.0, 1e9)             # target never reached; still resolves
+    st = search.build_trades(SYN_COINS[:1], period="in", specs=TINY_SPECS[:1], store_dir=tmp_path / "e")
+    for p in (tmp_path / "e").glob("*/*.pkl"):
+        pd.read_pickle(p).iloc[:0].to_pickle(p)            # force "no trades" for every file
+    st._cache = (None, None)
+    df = st[TINY_SPECS[0]]
+    assert len(df) == 0 and list(df.columns) == search.TRADE_COLUMNS + search.FEATURES
+    for c in ("signal_time", "decision_time", "entry_time", "exit_time"):
+        assert str(df[c].dtype) == "datetime64[ns, UTC]"
+    assert len(search.trades_for((TINY_DET[0], TINY_SPECS[0]), st, "out")) == 0
+
+
+def test_interrupted_write_is_redone(synthetic, tmp_path, monkeypatch):
+    sd = tmp_path / "st"
+    real_write, n = store_mod.TradeStore.write, []
+
+    def flaky(self, sym, tf, spec, df):
+        if len(n) == 1:
+            raise RuntimeError("boom")
+        n.append(1)
+        real_write(self, sym, tf, spec, df)
+
+    monkeypatch.setattr(store_mod.TradeStore, "write", flaky)
+    with pytest.raises(RuntimeError):
+        search.build_trades(SYN_COINS[:1], specs=TINY_SPECS, store_dir=sd)
+    d = sd / f"{SYN_COINS[0]}_{config.TIMEFRAMES[0]}"
+    assert len(list(d.glob("*.pkl"))) == 1 and not (d / "_done").exists()
+    monkeypatch.setattr(store_mod.TradeStore, "write", real_write)
+    st = search.build_trades(SYN_COINS[:1], specs=TINY_SPECS, store_dir=sd)
+    ref = search.build_trades(SYN_COINS[:1], specs=TINY_SPECS)
+    for s in TINY_SPECS:
+        pd.testing.assert_frame_equal(_sorted(ref[s]), _sorted(st[s]))
+
+
+def test_store_parallel_build_equals_serial(synthetic, tmp_path):
+    loaders = (_synthetic_1m, _synthetic_funding)       # top-level, so spawned workers can import
+    ser = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "s", loaders=loaders)
+    par = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "p", workers=2,
+                              loaders=loaders)
+    for s in TINY_SPECS:
+        assert len(par[s]) > 0
+        pd.testing.assert_frame_equal(_sorted(ser[s]), _sorted(par[s]))
+    again = search.build_trades(SYN_COINS, specs=TINY_SPECS, store_dir=tmp_path / "p", workers=2,
+                                loaders=None)   # all cached: loaders unused
+    assert len(again[TINY_SPECS[0]]) == len(par[TINY_SPECS[0]])
