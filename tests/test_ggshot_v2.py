@@ -585,3 +585,104 @@ def test_challenge_undecided_and_empty():
     assert out == {"passed": None, "time": None, "trades_taken": 2}
     empty = portfolio.challenge_outcome(_frame(rows).iloc[0:0], risk_usd=20.0)
     assert empty == {"passed": None, "time": None, "trades_taken": 0}
+
+
+# ---------------------------------------------------------------- metrics
+from models.ggshot_v2 import metrics  # noqa: E402
+
+
+def _seq(rs, symbols=None, years=None, npr=50.0):
+    """Non-overlapping sequential trades (10 min each) with the given r_net values."""
+    rows = []
+    for i, r in enumerate(rs):
+        row = _t(symbols[i] if symbols else "BTCUSDT", "1h", 10 * i, 10 * i + 5, r_net=r, npr=npr)
+        row["decision_time"] = (pd.Timestamp(f"{years[i]}-06-01", tz="UTC") if years
+                                else row["entry_time"])
+        rows.append(row)
+    return _frame(rows)
+
+
+def test_bootstrap_bounds():
+    assert metrics.bootstrap_pass_rate(np.full(50, 2.0), 20.0, runs=200) == 1.0
+    assert metrics.bootstrap_pass_rate(np.full(50, -1.0), 20.0, runs=200) == 0.0
+    zero_edge = np.array([2.0, -1.0, -1.0])  # mean 0 -> about 300/800 = 37.5% reach +500 before -300
+    assert 0.2 < metrics.bootstrap_pass_rate(zero_edge, 20.0, runs=2000) < 0.6
+    # +1R winners but max_trades too small to reach +500 (needs 25 trades) -> counts as not passed
+    assert metrics.bootstrap_pass_rate(np.full(10, 1.0), 20.0, runs=50, max_trades=24) == 0.0
+    assert metrics.bootstrap_pass_rate(np.full(10, 1.0), 20.0, runs=50, max_trades=25) == 1.0
+
+
+def test_bootstrap_deterministic_and_fast():
+    import time
+    r = np.random.default_rng(3).normal(0.05, 1.2, 5000)
+    t0 = time.perf_counter()
+    a = metrics.bootstrap_pass_rate(r, 20.0, runs=5000, seed=7)
+    elapsed = time.perf_counter() - t0
+    assert a == metrics.bootstrap_pass_rate(r, 20.0, runs=5000, seed=7)
+    assert 0.0 <= a <= 1.0 and elapsed < 5.0
+
+
+def test_max_dd_and_pf():
+    s = metrics.summarize(_seq([2.0, -1.0, -1.0, 1.0]), 20.0)
+    # equity 5000 -> 5040 -> 5020 -> 5000 -> 5020 ; peak 5040, trough 5000
+    assert s["n"] == 4 and s["win_rate"] == pytest.approx(0.5) and s["avg_r"] == pytest.approx(0.25)
+    assert s["total_usd"] == pytest.approx(20.0) and s["pf"] == pytest.approx(60.0 / 40.0)
+    assert s["max_dd_pct"] == pytest.approx(40.0 / 5040.0)
+    assert s["peak_notional_usd"] == pytest.approx(1000.0)
+    assert s["challenge"] == {"passed": None, "time": None, "trades_taken": 4}
+    # a first-trade loss counts against the starting balance as the peak
+    assert metrics.summarize(_seq([-1.0]), 20.0)["max_dd_pct"] == pytest.approx(20.0 / 5000.0)
+
+
+def test_summarize_pf_edges_and_empty():
+    assert metrics.summarize(_seq([1.0, 1.0]), 20.0)["pf"] == float("inf")
+    assert metrics.summarize(_seq([-1.0, -1.0]), 20.0)["pf"] == 0.0
+    e = metrics.summarize(_seq([1.0]).iloc[0:0], 20.0)
+    assert e["n"] == 0 and e["total_usd"] == 0.0 and e["pf"] == 0.0 and e["max_dd_pct"] == 0.0
+    assert e["peak_notional_usd"] == 0.0 and np.isnan(e["win_rate"]) and np.isnan(e["avg_r"])
+    assert e["challenge"]["passed"] is None
+
+
+def test_robustness_flags_single_coin_dependence():
+    # BTC earns 160 of 180 total (8/9) -> coin_ok False; removing the top 5 (all trades) leaves 0 -> wo_top False
+    rs = [2.0] * 4 + [1.0]
+    syms = ["BTCUSDT"] * 4 + ["ETHUSDT"]
+    rb = metrics.robustness(_seq(rs, syms), 20.0)
+    assert rb["max_coin_share"] == pytest.approx(8 / 9) and rb["coin_ok"] is False
+    assert rb["n_ok"] is False and rb["wo_top_ok"] is False
+    # balanced: 100 trades over 5 coins, all +1R -> share 0.2, n ok, still profitable without the top 5
+    coins = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"] * 20
+    rb2 = metrics.robustness(_seq([1.0] * 100, coins), 20.0)
+    assert rb2["max_coin_share"] == pytest.approx(0.2)
+    assert rb2["n_ok"] is True and rb2["wo_top_ok"] is True and rb2["coin_ok"] is True
+    # non-positive total -> share 0 and wo_top False
+    rb3 = metrics.robustness(_seq([-1.0, 1.0, -1.0]), 20.0)
+    assert rb3["max_coin_share"] == 0.0 and rb3["wo_top_ok"] is False
+
+
+def test_breakdown_groups_by_symbol_and_year():
+    sel = _seq([1.0, -1.0, 2.0], ["BTCUSDT", "BTCUSDT", "ETHUSDT"], years=[2023, 2024, 2024])
+    by_sym = metrics.breakdown(sel, "symbol")
+    assert list(by_sym.columns) == ["n", "win_rate", "avg_r", "total_usd"]
+    assert by_sym.loc["BTCUSDT"].tolist() == pytest.approx([2, 0.5, 0.0, 0.0])
+    assert by_sym.loc["ETHUSDT"].tolist() == pytest.approx([1, 1.0, 2.0, 40.0])
+    by_year = metrics.breakdown(sel, "year")
+    assert list(by_year.index) == [2023, 2024]
+    assert by_year.loc[2024].tolist() == pytest.approx([2, 0.5, 0.5, 20.0])
+    assert metrics.breakdown(sel, "tf").loc["1h", "n"] == 3
+
+
+def test_verdict_requires_all_gates():
+    summary = {"win_rate": 0.45, "max_dd_pct": 0.05, "challenge": {"passed": True}}
+    robust = {"n_ok": True, "wo_top_ok": True, "coin_ok": True}
+    v = metrics.verdict(summary, robust, 0.7)
+    assert v == {"win_rate": True, "max_dd": True, "challenge": True, "bootstrap": True,
+                 "n_ok": True, "wo_top_ok": True, "coin_ok": True, "passed": True}
+    assert not metrics.verdict({**summary, "win_rate": 0.39}, robust, 0.7)["passed"]
+    assert not metrics.verdict({**summary, "max_dd_pct": 0.10}, robust, 0.7)["passed"]
+    assert not metrics.verdict({**summary, "challenge": {"passed": None}}, robust, 0.7)["passed"]
+    assert not metrics.verdict(summary, robust, 0.64)["passed"]
+    for k in ("n_ok", "wo_top_ok", "coin_ok"):
+        v = metrics.verdict(summary, {**robust, k: False}, 0.7)
+        assert v[k] is False and v["passed"] is False
+    assert metrics.verdict({**summary, "win_rate": 0.40}, robust, 0.65)["passed"] is True
