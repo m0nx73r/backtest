@@ -489,3 +489,99 @@ def test_confirm_stop_on_entry_bar_fills_at_stop_not_prior_open():
     e = 100.5 * (1 + SLIP)
     assert t.entry_px == pytest.approx(e) and t.exit_reason == "SL"
     assert t.exit_px == pytest.approx((e - 0.4) * (1 - SLIP))
+
+
+# ---------------------------------------------------------------- portfolio
+from models.ggshot_v2 import portfolio  # noqa: E402
+
+P0 = pd.Timestamp("2024-03-01 00:00", tz="UTC")
+
+
+def _t(symbol, tf, entry_min, exit_min, r_net=1.0, npr=50.0):
+    """Minimal trade row; times are minutes after P0."""
+    return {"symbol": symbol, "tf": tf, "entry_time": P0 + pd.Timedelta(minutes=entry_min),
+            "exit_time": P0 + pd.Timedelta(minutes=exit_min), "r_net": r_net,
+            "notional_per_risk": npr}
+
+
+def _frame(rows, index=None):
+    return pd.DataFrame(rows, index=index)
+
+
+def _cands():
+    # 5 coins enter at minute 60 (given in scrambled order) + a second BTC trade while BTC is open
+    rows = [_t("XRPUSDT", "1h", 60, 120), _t("SOLUSDT", "1h", 60, 120), _t("BNBUSDT", "1h", 60, 120),
+            _t("ETHUSDT", "1h", 60, 120), _t("BTCUSDT", "1h", 60, 120),
+            _t("BTCUSDT", "1h", 90, 150)]
+    return _frame(rows)
+
+
+def test_max_three_open_and_one_per_coin():
+    sel = portfolio.select_trades(_cands())
+    assert len(sel) == 3 and list(sel.symbol) == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]  # coin order tie-break
+    # the second BTC trade is rejected on its own (same coin open), even with free slots
+    sel2 = portfolio.select_trades(_frame([_t("BTCUSDT", "1h", 60, 120), _t("BTCUSDT", "1h", 90, 150)]))
+    assert len(sel2) == 1 and sel2.iloc[0].entry_time == P0 + pd.Timedelta(minutes=60)
+
+
+def test_1h_beats_30m_on_same_close():
+    # BTC/30m listed first and has the better coin rank, but 1h outranks it; one slot only
+    rows = [_t("BTCUSDT", "30m", 60, 120), _t("ETHUSDT", "1h", 60, 120)]
+    sel = portfolio.select_trades(_frame(rows), max_open=1)
+    assert len(sel) == 1 and sel.iloc[0].symbol == "ETHUSDT" and sel.iloc[0].tf == "1h"
+
+
+def test_slot_frees_at_exit_time():
+    rows = [_t("BTCUSDT", "1h", 0, 60), _t("ETHUSDT", "1h", 59, 100), _t("SOLUSDT", "1h", 60, 120),
+            _t("BTCUSDT", "1h", 60, 90)]
+    sel = portfolio.select_trades(_frame(rows), max_open=1)
+    # ETH at 59 is blocked (BTC open); at 60 BTC has exited, so the slot is free: BTC (coin rank) wins
+    assert [(r.symbol, r.entry_time) for r in sel.itertuples()] == [
+        ("BTCUSDT", P0), ("BTCUSDT", P0 + pd.Timedelta(minutes=60))]
+    # same coin may re-enter exactly at its own exit time
+    rows2 = [_t("BTCUSDT", "1h", 0, 60), _t("BTCUSDT", "1h", 60, 120)]
+    assert len(portfolio.select_trades(_frame(rows2))) == 2
+
+
+def test_select_keeps_index_and_does_not_mutate_input():
+    df = _frame([_t("ETHUSDT", "1h", 60, 120), _t("BTCUSDT", "1h", 60, 120), _t("SOLUSDT", "30m", 0, 30)],
+                index=[10, 20, 30])
+    before = df.copy(deep=True)
+    sel = portfolio.select_trades(df)
+    assert list(sel.index) == [30, 20, 10]  # entry order, then coin rank
+    pd.testing.assert_frame_equal(df, before)
+
+
+def test_equity_curve_events_and_exit_before_entry():
+    rows = [_t("BTCUSDT", "1h", 0, 60, r_net=2.0, npr=50.0), _t("ETHUSDT", "1h", 60, 120, r_net=-1.0, npr=40.0)]
+    ec = portfolio.equity_curve(_frame(rows), risk_usd=20.0)
+    assert list(ec.columns) == ["time", "kind", "closed_equity", "open_risk_usd", "open_notional_usd"]
+    assert list(ec.kind) == ["entry", "exit", "entry", "exit"]  # exit@60 precedes entry@60
+    assert list(ec.closed_equity) == pytest.approx([5000.0, 5040.0, 5040.0, 5020.0])
+    assert list(ec.open_risk_usd) == pytest.approx([20.0, 0.0, 20.0, 0.0])
+    assert list(ec.open_notional_usd) == pytest.approx([1000.0, 0.0, 800.0, 0.0])
+
+
+def test_challenge_fail_uses_open_risk():
+    # one early loss of -12.5 (artificial R) brings closed equity to 4,750, then 3 trades open together
+    rows = [_t("BTCUSDT", "1h", 0, 10, r_net=-12.5),
+            _t("ETHUSDT", "1h", 20, 200), _t("SOLUSDT", "1h", 30, 200), _t("BNBUSDT", "1h", 40, 200),
+            _t("XRPUSDT", "1h", 50, 200)]
+    out = portfolio.challenge_outcome(_frame(rows), risk_usd=20.0)
+    # 4750 - 20 = 4730, 4750 - 40 = 4710, 4750 - 60 = 4690 <= 4700 -> fail at the third open entry
+    assert out == {"passed": False, "time": P0 + pd.Timedelta(minutes=40), "trades_taken": 4}
+
+
+def test_challenge_pass_on_exit():
+    # +1.97R at $20 = +39.4 each: 12 wins = 5,472.8 (not yet), 13th win = 5,512.2
+    rows = [_t("BTCUSDT", "1h", 10 * i, 10 * i + 5, r_net=1.97) for i in range(15)]
+    out = portfolio.challenge_outcome(_frame(rows), risk_usd=20.0)
+    assert out == {"passed": True, "time": P0 + pd.Timedelta(minutes=125), "trades_taken": 13}
+
+
+def test_challenge_undecided_and_empty():
+    rows = [_t("BTCUSDT", "1h", 0, 10, r_net=1.0), _t("ETHUSDT", "1h", 20, 30, r_net=-1.0)]
+    out = portfolio.challenge_outcome(_frame(rows), risk_usd=20.0)
+    assert out == {"passed": None, "time": None, "trades_taken": 2}
+    empty = portfolio.challenge_outcome(_frame(rows).iloc[0:0], risk_usd=20.0)
+    assert empty == {"passed": None, "time": None, "trades_taken": 0}
