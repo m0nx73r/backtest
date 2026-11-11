@@ -105,6 +105,11 @@ python -m models.liquidity_transfer.backtest_liquidity_transfer --symbol BTC/USD
 python -m pytest tests models/liquidity_transfer -q            # includes look-ahead tests
 ```
 
+### GG-Shot v2 (futures, 2021 – Nov 2026)
+
+A 4,032-configuration search of a GG-Shot-style breakout on 15 Binance USDT-M coins (30m/1h, fees, slippage and funding included) **failed the acceptance bar**: no finalist reached a 40% win rate (about 28–30% at 3R) out-of-sample.
+Full results, control test and next options: [`docs/research/ggshot-v2-results.md`](docs/research/ggshot-v2-results.md). Run it with `python -m models.ggshot_v2.run search`.
+
 ---
 
 ## 🛠️ Configuration Tuning
